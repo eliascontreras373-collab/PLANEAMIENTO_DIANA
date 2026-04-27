@@ -551,6 +551,19 @@ def _obtener_supervisor_develz(df):
         return df[col_sup].fillna("Sin Supervisor").astype(str).str.strip().replace("", "Sin Supervisor")
     return pd.Series(["Sin Supervisor"] * len(df), index=df.index)
 
+def _obtener_asesor_creador_develz(df):
+    """Asesor para FIJA IAE: usa la columna CREADOR de FIJA_DC/FIJA_TELETALK."""
+    col_creador = encontrar_columna(df, [
+        "CREADOR", "Creador", "creador",
+        "Usuario Creador", "USUARIO CREADOR",
+        "Datos Adicionales - Creador", "Datos adicionales - Creador"
+    ])
+    if col_creador:
+        asesor = df[col_creador].fillna("Sin Asesor").astype(str).str.strip()
+        asesor = asesor.replace("", "Sin Asesor")
+        return asesor
+    return pd.Series(["Sin Asesor"] * len(df), index=df.index)
+
 def _obtener_nombre_cliente_develz(df):
     nom_col = encontrar_columna(df, ["Cliente - Nombre", "NOMBRE", "Nombre", "CLIENTE"])
     ape_pat_col = encontrar_columna(df, ["Cliente - Apellido Paterno", "Apellido Paterno", "APELLIDO PATERNO"])
@@ -617,7 +630,7 @@ def _base_claro_pago(tabla_ventas):
 def construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes):
     """Construye detalle desde DEVELZ, no desde Claro. Incluye ventas sin SOT."""
     cols_salida = [
-        "Canal", "SOT", "Documento", "SUPERVISOR", "Nombre del Cliente", "Departamento",
+        "Canal", "SOT", "Documento", "SUPERVISOR", "ASESOR", "Nombre del Cliente", "Departamento",
         "FECHA INSTALACION", "TIPIS", "Estado Operativo",
         "COMISION", "Estado Pago"
     ]
@@ -642,6 +655,7 @@ def construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes)
             return pd.DataFrame(columns=cols_salida)
 
         df_m["SUPERVISOR"] = _obtener_supervisor_develz(df_m)
+        df_m["ASESOR"] = _obtener_asesor_creador_develz(df_m)
         df_m["Nombre del Cliente"] = _obtener_nombre_cliente_develz(df_m)
         df_m["Departamento"] = _obtener_departamento_develz(df_m)
         df_m["TIPIS"] = _obtener_tipis_develz(df_m)
@@ -758,6 +772,139 @@ def ranking_asesores_detalle(df):
         "Comision": grp["Comision"].sum(),
     }])
     return pd.concat([grp, total_row], ignore_index=True)
+
+def ranking_asesores_fija_develz(df):
+    """Ranking IAE FIJA usando base DEVELZ completa y asesor = CREADOR."""
+    cols = ["Rank", "ASESOR", "Total", "Pagadas", "Caidas", "% Efectividad", "Comision"]
+    if df.empty or "ASESOR" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    base = df.copy()
+    base["ASESOR"] = base["ASESOR"].fillna("Sin Asesor").astype(str).str.strip().replace("", "Sin Asesor")
+    base["COMISION"] = pd.to_numeric(base.get("COMISION", 0), errors="coerce").fillna(0)
+
+    grp = base.groupby("ASESOR", dropna=False).agg(
+        Total=("Estado Pago", "count"),
+        Pagadas=("Estado Pago", lambda x: (x == "PAGADA").sum()),
+        Caidas=("Estado Pago", lambda x: (x == "CAÍDA").sum()),
+        Comision=("COMISION", "sum"),
+    ).reset_index().sort_values(["Comision", "Pagadas", "Total"], ascending=[False, False, False]).reset_index(drop=True)
+
+    grp.insert(0, "Rank", grp.index + 1)
+    grp["% Efectividad"] = (grp["Pagadas"] / grp["Total"] * 100).round(2).astype(str) + "%"
+
+    total = pd.DataFrame([{
+        "Rank": "TOTAL",
+        "ASESOR": "",
+        "Total": int(grp["Total"].sum()),
+        "Pagadas": int(grp["Pagadas"].sum()),
+        "Caidas": int(grp["Caidas"].sum()),
+        "% Efectividad": "",
+        "Comision": float(grp["Comision"].sum())
+    }])
+
+    return pd.concat([grp[cols], total[cols]], ignore_index=True)
+
+def mostrar_iae_asesor_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes, key_asesor, color):
+    """Vista IAE ASESOR FIJA con la misma lógica de Detalle FIJA General.
+    Base: FIJA_DC/FIJA_TELETALK. Asesor: CREADOR.
+    Pago: cruce SOT contra CLARO con COMISIONES = SI o comisión > 0.
+    Sin tabla de detalle visible; solo KPIs y ranking con filtros.
+    """
+    df_det = construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes)
+
+    if df_det.empty:
+        st.warning("Sin datos.")
+        return
+
+    if "ASESOR" not in df_det.columns:
+        df_det["ASESOR"] = "Sin Asesor"
+    if "SUPERVISOR" not in df_det.columns:
+        df_det["SUPERVISOR"] = "Sin Supervisor"
+    if "TIPIS" not in df_det.columns:
+        df_det["TIPIS"] = "Sin TIPIS"
+
+    df_det["ASESOR"] = df_det["ASESOR"].fillna("Sin Asesor").astype(str).str.strip()
+    df_det.loc[df_det["ASESOR"].eq(""), "ASESOR"] = "Sin Asesor"
+
+    df_det["SUPERVISOR"] = df_det["SUPERVISOR"].fillna("Sin Supervisor").astype(str).str.strip()
+    df_det.loc[df_det["SUPERVISOR"].eq(""), "SUPERVISOR"] = "Sin Supervisor"
+
+    df_det["TIPIS"] = df_det["TIPIS"].fillna("Sin TIPIS").astype(str).str.strip()
+    df_det.loc[df_det["TIPIS"].eq(""), "TIPIS"] = "Sin TIPIS"
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        filtro_a = st.selectbox(
+            "Asesor / Creador",
+            ["Todos"] + sorted(df_det["ASESOR"].unique().tolist()),
+            key=key_asesor
+        )
+    with f2:
+        filtro_supervisor = st.selectbox(
+            "Supervisor",
+            ["Todos"] + sorted(df_det["SUPERVISOR"].unique().tolist()),
+            key=f"{key_asesor}_supervisor"
+        )
+    with f3:
+        filtro_tipificacion = st.selectbox(
+            "Tipificación",
+            ["Todos"] + sorted(df_det["TIPIS"].unique().tolist()),
+            key=f"{key_asesor}_tipificacion"
+        )
+
+    df_f = df_det.copy()
+    if filtro_a != "Todos":
+        df_f = df_f[df_f["ASESOR"] == filtro_a].copy()
+    if filtro_supervisor != "Todos":
+        df_f = df_f[df_f["SUPERVISOR"] == filtro_supervisor].copy()
+    if filtro_tipificacion != "Todos":
+        df_f = df_f[df_f["TIPIS"] == filtro_tipificacion].copy()
+
+    total, pagadas, caidas, comision, pct = kpi_detalle_fija(df_f)
+    color_borde = "#0f4287" if color == "dc" else "#70008f"
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    def _card(col, label, valor, sub=""):
+        with col:
+            st.markdown(
+                f'<div style="background:rgba(255,255,255,.95);padding:14px;border-radius:16px;'
+                f'border:2px solid {color_borde};text-align:center;margin-bottom:8px;min-height:86px;">'
+                f'<span style="color:#4b5563;font-weight:800;font-size:10px;text-transform:uppercase;display:block;">{label}</span>'
+                f'<span style="color:{color_borde};font-size:24px;font-weight:900;display:block;line-height:1.1;">{valor}</span>'
+                f'<span style="color:#6b7280;font-size:10px;">{sub}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+    _card(k1, "Total Ventas", f"{total:,}", "Base DEVELZ")
+    _card(k2, "Pagadas", f"{pagadas:,}", "Cruzan con CLARO")
+    _card(k3, "Caídas", f"{caidas:,}", "No pagadas / sin SOT")
+    _card(k4, "% Efectividad", f"{pct:.2f}%", "Pagadas / Total")
+    _card(k5, "Comisión", formatear_moneda(comision), "CLARO pagado")
+
+    st.write("---")
+    st.markdown("### 🏆 Ranking de Asesores")
+    ranking = ranking_asesores_fija_develz(df_f)
+    if ranking.empty:
+        st.warning("No se encontraron datos para el ranking.")
+    else:
+        st.dataframe(
+            ranking.style.format({"Comision": lambda x: formatear_moneda(x) if isinstance(x, (int, float)) else x}),
+            use_container_width=True,
+            height=460
+        )
+
+    csv_export = df_f.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        label="⬇️ Descargar base filtrada IAE asesor",
+        data=csv_export,
+        file_name=f"iae_asesor_fija_{canal}_{filtro_mes.replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"dl_iae_asesor_{canal}_{key_asesor}"
+    )
+
 
 def estados_operativos_df(df):
     """Resumen de estados operativos TIPIS agrupado. Nunca debe salir vacío si hay datos."""
@@ -2222,15 +2369,10 @@ if seccion == "fija":
     elif opcion == "D&C IAE ASESOR":
         set_bg(img_dc)
         st.markdown('<div class="section-title-dc">D&C IAE ASESOR</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-subtitle-dc">BASE FIJA_DC · ASESOR = CREADOR · CRUCE SOT CON CLARO_DC_FIJA</div>', unsafe_allow_html=True)
         st.write("---")
         filtro = st.selectbox("Fecha de Instalación", obtener_meses_fija("FECHA INSTALACION"), key="dc_iae_inst")
-        df_liq = obtener_reporte_liquidado("dbo.CLARO_DC_FIJA","[DATA DEVELZ].dbo.FIJA_DC", filtro)
-        if df_liq.empty: st.warning("Sin datos.")
-        else:
-            filtro_a = st.selectbox("Selecciona Asesor", ["Todos"]+sorted(df_liq["ASESOR"].fillna("Sin Asesor").unique().tolist()), key="dc_iae_asesor")
-            df_f = df_liq[df_liq["ASESOR"]==filtro_a].copy() if filtro_a!="Todos" else df_liq.copy()
-            st.markdown("### Ranking de Asesores")
-            mostrar_tabla_ranking(construir_ranking_asesores(df_f))
+        mostrar_iae_asesor_fija_develz("[DATA DEVELZ].dbo.FIJA_DC", "dbo.CLARO_DC_FIJA", "D&C", filtro, "dc_iae_asesor", "dc")
 
     elif opcion == "Teletalk Factor Instalación":
         set_bg(img_tt)
@@ -2251,15 +2393,10 @@ if seccion == "fija":
     elif opcion == "Teletalk IAE ASESOR":
         set_bg(img_tt)
         st.markdown('<div class="section-title-tt">Teletalk IAE ASESOR</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-subtitle-tt">BASE FIJA_TELETALK · ASESOR = CREADOR · CRUCE SOT CON CLARO_TELETALK_FIJA</div>', unsafe_allow_html=True)
         st.write("---")
         filtro = st.selectbox("Fecha de Instalación", obtener_meses_fija("FECHA INSTALACION"), key="tt_iae_inst")
-        df_liq = obtener_reporte_liquidado("dbo.CLARO_TELETALK_FIJA","[DATA DEVELZ].dbo.FIJA_TELETALK", filtro)
-        if df_liq.empty: st.warning("Sin datos.")
-        else:
-            filtro_a = st.selectbox("Selecciona Asesor", ["Todos"]+sorted(df_liq["ASESOR"].fillna("Sin Asesor").unique().tolist()), key="tt_iae_asesor")
-            df_f = df_liq[df_liq["ASESOR"]==filtro_a].copy() if filtro_a!="Todos" else df_liq.copy()
-            st.markdown("### Ranking de Asesores")
-            mostrar_tabla_ranking(construir_ranking_asesores(df_f))
+        mostrar_iae_asesor_fija_develz("[DATA DEVELZ].dbo.FIJA_TELETALK", "dbo.CLARO_TELETALK_FIJA", "Teletalk", filtro, "tt_iae_asesor", "tt")
 
 # =========================================================
 # 13. VISTAS MÓVIL
