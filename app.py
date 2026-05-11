@@ -7,7 +7,7 @@ from io import BytesIO
 # =========================================================
 # 1. CONFIGURACIÓN GENERAL
 # =========================================================
-st.set_page_config(page_title="Dashboard Corporativo Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Dashboard Teletalk Digital", layout="wide", initial_sidebar_state="expanded")
 
 # =========================================================
 # 2. ESTILOS / FONDO
@@ -51,6 +51,7 @@ MESES_MAP = {v.lower(): k for k, v in MESES_ES.items()}
 
 CSV_MAP = {
     "dbo.CLARO_DC_FIJA":              "CLARO_DC_FIJA.csv",
+    "dbo.CLARO_DC_FIJA_SEGUNDA_CAIDA": "CLARO_DC_FIJA_SEGUNDA_CAIDA.csv",
     "dbo.CLARO_TELETALK_FIJA":        "CLARO_TELETALK_FIJA.csv",
     "dbo.CLARO_DC_MOVIL":             "CLARO_DC_MOVIL.csv",
     "dbo.CLARO_TELETALK_MOVIL":       "CLARO_TELETALK_MOVIL.csv",
@@ -79,7 +80,9 @@ TIPIS_ESTADO_MAP = {
 }
 
 ruta_base    = "."
-img_caratula = os.path.join(ruta_base, "caratula.png.jpg")
+img_caratula_png = os.path.join(ruta_base, "caratula.png")
+img_caratula_jpg = os.path.join(ruta_base, "caratula.png.jpg")
+img_caratula = img_caratula_png if os.path.exists(img_caratula_png) else img_caratula_jpg
 img_dc       = os.path.join(ruta_base, "34bab75f-2b2e-455e-8935-377abf566b76.jpg")
 img_tt       = os.path.join(ruta_base, "ab3ac40e-1612-430f-bb3a-817d24b709db.jpg")
 
@@ -110,7 +113,7 @@ def get_tabla(nombre):
     return cargar_csv(CSV_MAP.get(nombre, nombre.split(".")[-1] + ".csv"))
 
 def preparar_fechas_fija(df):
-    for col in ["FECHA INSTALACION", "FECHA GENERACION"]:
+    for col in ["FECHA INSTALACION", "FECHA GENERACION", "FECHA DE VENTA"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
     return df
@@ -145,6 +148,98 @@ def formatear_moneda(v):
     try: return f"S/ {float(v):,.2f}"
     except: return "S/ 0.00"
 
+
+# =========================================================
+# AUDITORÍA DE DESCARGAS
+# =========================================================
+def registrar_descarga(seccion, archivo, filtros=""):
+    """Registra cada descarga realizada por los usuarios del dashboard."""
+    try:
+        from datetime import datetime
+        log_file = os.path.join(DATA_DIR, "log_descargas.csv")
+        usuario = st.session_state.get("usuario_logueado", "Sin usuario")
+
+        nuevo = pd.DataFrame([{
+            "fecha_hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "usuario": usuario,
+            "seccion": seccion,
+            "archivo": archivo,
+            "filtros": filtros,
+            "accion": "DESCARGA"
+        }])
+
+        if os.path.exists(log_file):
+            anterior = pd.read_csv(log_file, encoding="utf-8-sig")
+            final = pd.concat([anterior, nuevo], ignore_index=True)
+        else:
+            final = nuevo
+
+        final.to_csv(log_file, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        # No detenemos el dashboard si falla el log.
+        print(f"Error registrando descarga: {e}")
+
+
+def mostrar_auditoria_descargas():
+    """Ventana oculta para administrador: solo visible para Fiorella."""
+    set_bg(img_caratula)
+    st.markdown('<div class="section-title-dc">🔒 Auditoría de Descargas</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-subtitle-dc">Control interno de usuarios, archivos descargados y filtros usados</div>', unsafe_allow_html=True)
+    st.write("---")
+
+    usuario_actual = st.session_state.get("usuario_logueado", "")
+    if usuario_actual != "Fiorella":
+        st.error("Acceso restringido. Esta sección solo está habilitada para el administrador.")
+        return
+
+    log_file = os.path.join(DATA_DIR, "log_descargas.csv")
+    if not os.path.exists(log_file):
+        st.info("Todavía no hay descargas registradas.")
+        return
+
+    df_log = pd.read_csv(log_file, encoding="utf-8-sig")
+    if df_log.empty:
+        st.info("Todavía no hay descargas registradas.")
+        return
+
+    df_log["fecha_hora"] = pd.to_datetime(df_log["fecha_hora"], errors="coerce")
+    df_log = df_log.sort_values("fecha_hora", ascending=False)
+
+    total_descargas = len(df_log)
+    usuarios_unicos = df_log["usuario"].nunique() if "usuario" in df_log.columns else 0
+    ultimo_registro = df_log["fecha_hora"].max().strftime("%d/%m/%Y %H:%M:%S") if df_log["fecha_hora"].notna().any() else "Sin fecha"
+
+    c1, c2, c3 = st.columns(3)
+    _kpi_card_html(c1, "Total Descargas", f"{total_descargas:,}", "Histórico registrado", "#0f4287", "#0f4287")
+    _kpi_card_html(c2, "Usuarios", f"{usuarios_unicos:,}", "Usuarios con actividad", "#0f4287", "#0f4287")
+    _kpi_card_html(c3, "Última Descarga", ultimo_registro, "Registro más reciente", "#0f4287", "#0f4287")
+
+    st.write("---")
+    f1, f2 = st.columns(2)
+    with f1:
+        usuarios = ["Todos"] + sorted(df_log["usuario"].dropna().astype(str).unique().tolist()) if "usuario" in df_log.columns else ["Todos"]
+        filtro_usuario = st.selectbox("Filtrar por usuario", usuarios, key="audit_usuario")
+    with f2:
+        secciones = ["Todas"] + sorted(df_log["seccion"].dropna().astype(str).unique().tolist()) if "seccion" in df_log.columns else ["Todas"]
+        filtro_seccion = st.selectbox("Filtrar por sección", secciones, key="audit_seccion")
+
+    df_show = df_log.copy()
+    if filtro_usuario != "Todos" and "usuario" in df_show.columns:
+        df_show = df_show[df_show["usuario"].astype(str) == filtro_usuario]
+    if filtro_seccion != "Todas" and "seccion" in df_show.columns:
+        df_show = df_show[df_show["seccion"].astype(str) == filtro_seccion]
+
+    df_show["fecha_hora"] = df_show["fecha_hora"].dt.strftime("%d/%m/%Y %H:%M:%S")
+    st.dataframe(df_show, use_container_width=True, height=480)
+
+    st.download_button(
+        "⬇️ Descargar historial de auditoría",
+        data=df_log.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="auditoria_descargas.csv",
+        mime="text/csv",
+        key="dl_auditoria_descargas"
+    )
+
 def parse_mes_anio(txt):
     if not txt or txt == "Todos los meses": return None, None
     p = txt.strip().lower().split()
@@ -173,6 +268,16 @@ def _es_alta_movil(serie):
 def obtener_meses_fija(col):
     meses = set()
     for nombre in ["CLARO_DC_FIJA.csv","CLARO_TELETALK_FIJA.csv"]:
+        df = preparar_fechas_fija(cargar_csv(nombre))
+        if col in df.columns:
+            meses.update(f"{MESES_ES[f.month].capitalize()} {f.year}" for f in df[col].dropna())
+    return (["Todos los meses"] +
+            sorted(meses, key=lambda s: (int(s.split()[1]), MESES_MAP.get(s.split()[0].lower(), 0))))
+
+@st.cache_data(ttl=300)
+def obtener_meses_fija_develz(col):
+    meses = set()
+    for nombre in ["FIJA_DC.csv", "FIJA_TELETALK.csv"]:
         df = preparar_fechas_fija(cargar_csv(nombre))
         if col in df.columns:
             meses.update(f"{MESES_ES[f.month].capitalize()} {f.year}" for f in df[col].dropna())
@@ -490,8 +595,21 @@ def _estado_desde_tipis(tipis_txt):
     return TIPIS_ESTADO_MAP.get(_normalizar_texto(tipis_txt), "Otros")
 
 def _normalizar_sot_series(serie):
-    s = serie.fillna("").astype(str).str.strip().str.replace(r"\.0$","",regex=True)
-    return s.replace(["nan","NaN","None","NONE","null","NULL"], "")
+    """
+    Normaliza SOT para cruces entre DEVELZ y CLARO.
+    Corrige casos como:
+    - 87274852.0  -> 87274852
+    - 87274852    -> 87274852
+    - espacios invisibles
+    - valores nulos
+    """
+    s = serie.fillna("").astype(str).str.strip()
+    s = s.str.replace("\\u00a0", "", regex=False)
+    s = s.str.replace(r"\s+", "", regex=True)
+    s = s.str.replace(r"\.0$", "", regex=True)
+    s = s.str.replace(r"\.00$", "", regex=True)
+    s = s.replace(["nan","NaN","None","NONE","null","NULL","NaT","<NA>"], "")
+    return s
 
 # --- Obtención de campos DEVELZ ---
 def _obtener_sot_develz(df):
@@ -501,6 +619,12 @@ def _obtener_sot_develz(df):
 def _obtener_fecha_inst_develz(df):
     col = encontrar_columna(df, ["Back Office - Fecha Instalacion","Back Office - Fecha Instalación",
                                   "FECHA INSTALACION","Fecha Instalacion","Fecha Instalación"])
+    return pd.to_datetime(df[col], errors="coerce", dayfirst=True) if col else pd.Series(pd.NaT, index=df.index)
+
+def _obtener_fecha_venta_develz(df):
+    col = encontrar_columna(df, ["FECHA DE VENTA", "Fecha de Venta", "Fecha Venta", "FECHA VENTA",
+                                  "Back Office - Fecha de Venta", "Back Office - Fecha Venta",
+                                  "FECHA GENERACION", "Fecha Generacion", "Fecha Generación"])
     return pd.to_datetime(df[col], errors="coerce", dayfirst=True) if col else pd.Series(pd.NaT, index=df.index)
 
 def _obtener_supervisor_develz(df):
@@ -551,7 +675,7 @@ def _base_claro_pago(tabla_ventas):
     if df_c.empty or "SOT" not in df_c.columns:
         return pd.DataFrame(columns=cols)
     df_c = df_c.copy()
-    df_c["SOT"] = df_c["SOT"].fillna("").astype(str).str.strip()
+    df_c["SOT"] = _normalizar_sot_series(df_c["SOT"])
     df_c = df_c[df_c["SOT"] != ""]
     df_c["COMISION_CLARO"] = obtener_comision_fija(df_c)
     df_c["COMISIONES_CLARO"] = (df_c["COMISIONES"].fillna("").astype(str).str.upper().str.strip().str.replace("Í","I",regex=False)
@@ -563,21 +687,29 @@ def _base_claro_pago(tabla_ventas):
     return resumen[cols]
 
 @st.cache_data(ttl=300)
-def construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes):
+def construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes, filtro_fecha_venta="Todos los meses"):
     cols_salida = ["Canal","SOT","Documento","SUPERVISOR","ASESOR","Nombre del Cliente","Departamento",
-                   "FECHA INSTALACION","TIPIS","Estado Operativo","COMISION","Estado Pago"]
+                   "FECHA INSTALACION","FECHA DE VENTA","TIPIS","Estado Operativo","COMISION","Estado Pago"]
     try:
         df_m = get_tabla(tabla_maestro)
         if df_m.empty: return pd.DataFrame(columns=cols_salida)
         df_m = df_m.copy()
         df_m["Canal"] = canal
-        df_m["SOT"] = _obtener_sot_develz(df_m)
+        df_m["SOT"] = _normalizar_sot_series(_obtener_sot_develz(df_m))
         df_m["Documento"] = _obtener_documento_develz(df_m)
         df_m["_FECHA_DT"] = _obtener_fecha_inst_develz(df_m)
+        df_m["_FECHA_VENTA_DT"] = _obtener_fecha_venta_develz(df_m)
+
         if filtro_mes != "Todos los meses":
             m, y = parse_mes_anio(filtro_mes)
             if m and y:
                 df_m = df_m[(df_m["_FECHA_DT"].dt.month == m) & (df_m["_FECHA_DT"].dt.year == y)].copy()
+
+        if filtro_fecha_venta != "Todos los meses":
+            m_v, y_v = parse_mes_anio(filtro_fecha_venta)
+            if m_v and y_v:
+                df_m = df_m[(df_m["_FECHA_VENTA_DT"].dt.month == m_v) & (df_m["_FECHA_VENTA_DT"].dt.year == y_v)].copy()
+
         if df_m.empty: return pd.DataFrame(columns=cols_salida)
         df_m["SUPERVISOR"] = _obtener_supervisor_develz(df_m)
         df_m["ASESOR"] = _obtener_asesor_creador_develz(df_m)
@@ -587,11 +719,23 @@ def construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes)
         df_m["Estado Operativo"] = df_m["TIPIS"].apply(_estado_desde_tipis)
         df_pago = _base_claro_pago(tabla_claro)
         df = df_m.merge(df_pago, on="SOT", how="left")
+
+        # Diagnóstico interno opcional:
+        # Si necesitas revisar el cruce, puedes activar:
+        # st.session_state["debug_detalle_fija"] = True
+        if st.session_state.get("debug_detalle_fija", False):
+            st.write(f"DEBUG {canal} | Base DEVELZ:", len(df_m))
+            st.write(f"DEBUG {canal} | SOT DEVELZ únicos:", df_m["SOT"].nunique())
+            st.write(f"DEBUG {canal} | Base CLARO pagos:", len(df_pago))
+            st.write(f"DEBUG {canal} | Cruces encontrados:", df["COMISION_CLARO"].notna().sum())
+            st.write(f"DEBUG {canal} | Pagadas SI:", (df.get("COMISIONES_CLARO", "").fillna("").astype(str).str.upper() == "SI").sum())
+            st.write(f"DEBUG {canal} | Comisión mayor a 0:", (pd.to_numeric(df.get("COMISION_CLARO", 0), errors="coerce").fillna(0) > 0).sum())
         df["COMISION"] = pd.to_numeric(df.get("COMISION_CLARO", 0), errors="coerce").fillna(0)
         df["COMISIONES_CLARO"] = df.get("COMISIONES_CLARO","").fillna("").astype(str).str.upper().str.strip().str.replace("Í","I",regex=False)
         df["Estado Pago"] = "CAÍDA"
         df.loc[(df["COMISIONES_CLARO"] == "SI") | (df["COMISION"] > 0), "Estado Pago"] = "PAGADA"
         df["FECHA INSTALACION"] = df["_FECHA_DT"].dt.strftime("%d/%m/%Y").fillna("")
+        df["FECHA DE VENTA"] = df["_FECHA_VENTA_DT"].dt.strftime("%d/%m/%Y").fillna("")
         for col in cols_salida:
             if col not in df.columns: df[col] = ""
         return df[cols_salida].reset_index(drop=True)
@@ -600,9 +744,9 @@ def construir_detalle_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes)
         return pd.DataFrame(columns=cols_salida)
 
 @st.cache_data(ttl=300)
-def construir_detalle_fija_general(filtro_mes):
-    df_dc = construir_detalle_fija_develz("[DATA DEVELZ].dbo.FIJA_DC", "dbo.CLARO_DC_FIJA", "D&C", filtro_mes)
-    df_tt = construir_detalle_fija_develz("[DATA DEVELZ].dbo.FIJA_TELETALK", "dbo.CLARO_TELETALK_FIJA", "Teletalk", filtro_mes)
+def construir_detalle_fija_general(filtro_mes, filtro_fecha_venta="Todos los meses"):
+    df_dc = construir_detalle_fija_develz("[DATA DEVELZ].dbo.FIJA_DC", "dbo.CLARO_DC_FIJA", "D&C", filtro_mes, filtro_fecha_venta)
+    df_tt = construir_detalle_fija_develz("[DATA DEVELZ].dbo.FIJA_TELETALK", "dbo.CLARO_TELETALK_FIJA", "Teletalk", filtro_mes, filtro_fecha_venta)
     return pd.concat([df_dc, df_tt], ignore_index=True)
 
 def kpi_detalle_fija(df):
@@ -784,7 +928,9 @@ def mostrar_iae_asesor_fija_develz(tabla_maestro, tabla_claro, canal, filtro_mes
     csv_export = df_f.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(label="⬇️ Descargar base filtrada IAE asesor", data=csv_export,
         file_name=f"iae_asesor_fija_{canal}_{filtro_mes.replace(' ','_')}.csv", mime="text/csv",
-        key=f"dl_iae_asesor_{canal}_{key_asesor}")
+        key=f"dl_iae_asesor_{canal}_{key_asesor}",
+        on_click=registrar_descarga,
+        args=(f"IAE Asesor Fija {canal}", f"iae_asesor_fija_{canal}_{filtro_mes.replace(' ','_')}.csv", f"Mes: {filtro_mes}"))
 
 def estados_operativos_df(df):
     if df.empty: return pd.DataFrame()
@@ -920,7 +1066,9 @@ def mostrar_claro_pagado_no_develz(filtro_mes, filtro_canal):
     csv_export = df_faltantes.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button("⬇️ Descargar SOT pagados por CLARO no encontrados en DEVELZ", data=csv_export,
         file_name=f"claro_pagado_no_develz_{filtro_mes.replace(' ','_')}_{filtro_canal}.csv",
-        mime="text/csv", key="dl_claro_pagado_no_develz_detalle")
+        mime="text/csv", key="dl_claro_pagado_no_develz_detalle",
+        on_click=registrar_descarga,
+        args=("Claro pagado no DEVELZ", f"claro_pagado_no_develz_{filtro_mes.replace(' ','_')}_{filtro_canal}.csv", f"Mes: {filtro_mes} | Canal: {filtro_canal}"))
 
 def _kpi_card_html(col, label, valor, sub, color_borde, color_val="inherit"):
     with col:
@@ -955,6 +1103,344 @@ def _grafico_barras_agrupado(chart_melt, sort_order, x_title, bar_size=18):
     ).configure_view(strokeWidth=0
     ).configure_legend(titleFontSize=12, labelFontSize=12, orient="top-right", symbolSize=120)
 
+
+# =========================================================
+# 10B. F - COM.INDIRECTA 2da ETAPA
+# =========================================================
+def _normalizar_sot_col(df, col="SOT"):
+    if df.empty or col not in df.columns:
+        return pd.Series([""] * len(df), index=df.index)
+    return (df[col].fillna("").astype(str).str.strip()
+            .str.replace(r"\.0$", "", regex=True)
+            .replace(["nan", "NaN", "None", "NONE", "null", "NULL"], ""))
+
+
+def _obtener_fecha_preferida_fija(df):
+    for col in ["FECHA INSTALACION", "FECHA GENERACION", "FECHA DE VENTA", "FECHA OPERACION", "FECHA"]:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _normalizar_si_no(valor):
+    txt = str(valor).upper().strip()
+    txt = (txt.replace("Í", "I").replace("Á", "A").replace("É", "E")
+              .replace("Ó", "O").replace("Ú", "U"))
+    return txt
+
+
+def _obtener_columna_com_etapa(df):
+    return encontrar_columna(df, ["COM ETAPA", "COM_ETAPA", "Com Etapa", "Com etapa", "COMISION ETAPA", "COMISIÓN ETAPA"])
+
+
+def _obtener_supervisor_fija_dc_por_sot():
+    """Trae el supervisor desde FIJA_DC cruzando Back Office - Sot con SOT."""
+    cols = ["SOT", "SUPERVISOR"]
+    try:
+        df_sup = get_tabla("[DATA DEVELZ].dbo.FIJA_DC")
+        if df_sup.empty:
+            return pd.DataFrame(columns=cols)
+
+        col_sot = encontrar_columna(df_sup, ["Back Office - Sot", "Back Office - SOT", "SOT", "sot", "Sot"])
+        col_sup = encontrar_columna(df_sup, ["Datos Adicionales - Supervisor", "Datos adicionales - Supervisor", "SUPERVISOR", "Supervisor", "supervisor"])
+
+        if not col_sot:
+            return pd.DataFrame(columns=cols)
+
+        df_sup = df_sup.copy()
+        df_sup["SOT"] = _normalizar_sot_col(df_sup, col_sot)
+        df_sup = df_sup[df_sup["SOT"] != ""].copy()
+
+        if col_sup:
+            df_sup["SUPERVISOR"] = df_sup[col_sup].fillna("Sin Supervisor").astype(str).str.strip()
+            df_sup.loc[df_sup["SUPERVISOR"].eq(""), "SUPERVISOR"] = "Sin Supervisor"
+        else:
+            df_sup["SUPERVISOR"] = "Sin Supervisor"
+
+        df_sup = df_sup.groupby("SOT", as_index=False).agg(SUPERVISOR=("SUPERVISOR", "first"))
+        return df_sup[cols]
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+@st.cache_data(ttl=300)
+def obtener_supervisores_segunda_caida_dc(filtro_mes_base="Todos los meses"):
+    try:
+        df_base = preparar_fechas_fija(get_tabla("dbo.CLARO_DC_FIJA"))
+        if df_base.empty or "SOT" not in df_base.columns:
+            return ["Todos"]
+
+        df_base = df_base.copy()
+        df_base["SOT"] = _normalizar_sot_col(df_base, "SOT")
+        df_base = df_base[df_base["SOT"] != ""].copy()
+
+        if filtro_mes_base != "Todos los meses" and "FECHA INSTALACION" in df_base.columns:
+            df_base = filtrar_por_mes_anio(df_base, "FECHA INSTALACION", filtro_mes_base)
+
+        df_sup = _obtener_supervisor_fija_dc_por_sot()
+        df_base = df_base.merge(df_sup, on="SOT", how="left")
+        df_base["SUPERVISOR"] = df_base.get("SUPERVISOR", "Sin Supervisor").fillna("Sin Supervisor").astype(str).str.strip()
+        df_base.loc[df_base["SUPERVISOR"].eq(""), "SUPERVISOR"] = "Sin Supervisor"
+
+        supervisores = sorted(df_base["SUPERVISOR"].dropna().astype(str).unique().tolist())
+        return ["Todos"] + supervisores
+    except Exception:
+        return ["Todos"]
+
+
+@st.cache_data(ttl=300)
+def construir_segunda_caida_fija_dc(filtro_mes_base="Todos los meses", filtro_supervisor="Todos"):
+    """
+    Cruza CLARO_DC_FIJA como base contra CLARO_DC_FIJA_SEGUNDA_CAIDA por SOT.
+    Supervisor se trae desde FIJA_DC:
+    - SOT base: CLARO_DC_FIJA[SOT]
+    - SOT supervisor: FIJA_DC[Back Office - Sot]
+    - Supervisor: FIJA_DC[Datos Adicionales - Supervisor]
+
+    Regla:
+    - Base: CLARO_DC_FIJA.
+    - Pagadas en 3 meses: solo SOT que cruzan y tienen APLICA = SI.
+    - Pendientes: SOT de base que no aparecen en segunda caída o aparecen con APLICA diferente de SI.
+    - Comisión recuperada: columna COM ETAPA del archivo CLARO_DC_FIJA_SEGUNDA_CAIDA.
+    """
+    try:
+        df_base = preparar_fechas_fija(get_tabla("dbo.CLARO_DC_FIJA"))
+        df_pago_raw = preparar_fechas_fija(get_tabla("dbo.CLARO_DC_FIJA_SEGUNDA_CAIDA"))
+
+        if df_base.empty or "SOT" not in df_base.columns:
+            return pd.DataFrame(), pd.DataFrame(), ""
+
+        df_base = df_base.copy()
+        df_base["SOT"] = _normalizar_sot_col(df_base, "SOT")
+        df_base = df_base[df_base["SOT"] != ""].copy()
+
+        if filtro_mes_base != "Todos los meses" and "FECHA INSTALACION" in df_base.columns:
+            df_base = filtrar_por_mes_anio(df_base, "FECHA INSTALACION", filtro_mes_base)
+
+        # Cruce para traer supervisor desde FIJA_DC por SOT
+        df_sup = _obtener_supervisor_fija_dc_por_sot()
+        df_base = df_base.merge(df_sup, on="SOT", how="left")
+        df_base["SUPERVISOR"] = df_base.get("SUPERVISOR", "Sin Supervisor").fillna("Sin Supervisor").astype(str).str.strip()
+        df_base.loc[df_base["SUPERVISOR"].eq(""), "SUPERVISOR"] = "Sin Supervisor"
+
+        if filtro_supervisor != "Todos":
+            df_base = df_base[df_base["SUPERVISOR"] == filtro_supervisor].copy()
+
+        if df_base.empty:
+            return pd.DataFrame(), pd.DataFrame(), ""
+
+        if df_pago_raw.empty or "SOT" not in df_pago_raw.columns:
+            df_base["APLICA_SEGUNDA_CAIDA"] = "NO ENCONTRADO"
+            df_base["Estado Segunda Caída"] = "PENDIENTE"
+            df_base["COMISION_RECUPERADA"] = 0.0
+            df_base["FECHA_PAGO_3_MESES"] = ""
+            return df_base.reset_index(drop=True), pd.DataFrame(), ""
+
+        df_pago = df_pago_raw.copy()
+        df_pago["SOT"] = _normalizar_sot_col(df_pago, "SOT")
+        df_pago = df_pago[df_pago["SOT"] != ""].copy()
+
+        col_fecha_pago = _obtener_fecha_preferida_fija(df_pago)
+
+        col_aplica = encontrar_columna(df_pago, ["APLICA", "Aplica", "aplica"])
+        if col_aplica:
+            df_pago["APLICA_SEGUNDA_CAIDA"] = df_pago[col_aplica].apply(_normalizar_si_no)
+        else:
+            df_pago["APLICA_SEGUNDA_CAIDA"] = "NO"
+
+        col_com_etapa = _obtener_columna_com_etapa(df_pago)
+        if col_com_etapa:
+            df_pago["COMISION_RECUPERADA"] = pd.to_numeric(df_pago[col_com_etapa], errors="coerce").fillna(0)
+        else:
+            df_pago["COMISION_RECUPERADA"] = 0.0
+
+        if col_fecha_pago:
+            df_pago["FECHA_PAGO_3_MESES"] = df_pago[col_fecha_pago].dt.strftime("%d/%m/%Y").fillna("")
+        else:
+            df_pago["FECHA_PAGO_3_MESES"] = ""
+
+        df_pago["CRUZA_SEGUNDA_CAIDA"] = "SI"
+        df_pago["PAGADO_3_MESES"] = df_pago["APLICA_SEGUNDA_CAIDA"].apply(lambda x: "SI" if x == "SI" else "NO")
+
+        resumen_pago = df_pago.groupby("SOT", as_index=False).agg(
+            COMISION_RECUPERADA=("COMISION_RECUPERADA", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).sum())),
+            FECHA_PAGO_3_MESES=("FECHA_PAGO_3_MESES", "first"),
+            APLICA_SEGUNDA_CAIDA=("APLICA_SEGUNDA_CAIDA", lambda x: "SI" if (x.astype(str).str.upper().str.strip() == "SI").any() else "NO"),
+            CRUZA_SEGUNDA_CAIDA=("CRUZA_SEGUNDA_CAIDA", "first")
+        )
+        resumen_pago["PAGADO_3_MESES"] = resumen_pago["APLICA_SEGUNDA_CAIDA"].apply(lambda x: "SI" if x == "SI" else "NO")
+
+        df = df_base.merge(resumen_pago, on="SOT", how="left")
+        df["COMISION_RECUPERADA"] = pd.to_numeric(df.get("COMISION_RECUPERADA", 0), errors="coerce").fillna(0)
+        df["APLICA_SEGUNDA_CAIDA"] = df.get("APLICA_SEGUNDA_CAIDA", "").fillna("NO ENCONTRADO")
+        df["PAGADO_3_MESES"] = df.get("PAGADO_3_MESES", "").fillna("NO")
+        df["CRUZA_SEGUNDA_CAIDA"] = df.get("CRUZA_SEGUNDA_CAIDA", "").fillna("NO")
+        df["FECHA_PAGO_3_MESES"] = df.get("FECHA_PAGO_3_MESES", "").fillna("")
+        df["Estado Segunda Caída"] = df["PAGADO_3_MESES"].apply(
+            lambda x: "PAGADA EN 3 MESES" if str(x).upper().strip() == "SI" else "PENDIENTE"
+        )
+
+        return df.reset_index(drop=True), df_pago.reset_index(drop=True), col_fecha_pago or ""
+    except Exception as e:
+        st.error(f"Error en F - COM.INDIRECTA 2da ETAPA: {e}")
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+
+def _ordenar_columnas_segunda_caida(df):
+    cols_prioridad = [
+        "SOT", "SUPERVISOR", "Estado Segunda Caída", "CRUZA_SEGUNDA_CAIDA", "APLICA_SEGUNDA_CAIDA",
+        "COMISION_RECUPERADA", "FECHA_PAGO_3_MESES", "FECHA INSTALACION", "FECHA GENERACION",
+        "FECHA DE VENTA", "USUARIO", "ASESOR", "CLIENTE", "NOMBRE", "Nombre del Cliente"
+    ]
+    cols_show = [c for c in cols_prioridad if c in df.columns]
+    resto = [c for c in df.columns if c not in cols_show]
+    return df[cols_show + resto].copy()
+
+
+def mostrar_segunda_caida_fija_dc():
+    set_bg(img_dc)
+    st.markdown('<div class="section-title-dc">F - COM.INDIRECTA 2da ETAPA</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-subtitle-dc">Cruce por SOT · CLARO_DC_FIJA vs CLARO_DC_FIJA_SEGUNDA_CAIDA · Supervisor desde FIJA_DC</div>', unsafe_allow_html=True)
+    st.write("---")
+
+    f1, f2 = st.columns(2)
+    with f1:
+        filtro_mes_base = st.selectbox(
+            "Fecha instalación base",
+            obtener_meses_fija("FECHA INSTALACION"),
+            key="seg_caida_dc_mes_base"
+        )
+    with f2:
+        filtro_supervisor = st.selectbox(
+            "Supervisor",
+            obtener_supervisores_segunda_caida_dc(filtro_mes_base),
+            key="seg_caida_dc_supervisor"
+        )
+
+    df, df_pago_original, col_fecha_pago = construir_segunda_caida_fija_dc(filtro_mes_base, filtro_supervisor)
+
+    if df.empty:
+        st.warning("No se encontraron datos en CLARO_DC_FIJA para el cruce con los filtros seleccionados.")
+        return
+
+    # =========================================================
+    # TABLAS FINALES DE EXPORTACIÓN / DETALLE
+    # =========================================================
+    # IMPORTANTE:
+    # Estas son las MISMAS tablas que se usan para el botón Descargar.
+    # El desplegable muestra estas variables para que el conteo visual cuadre
+    # con el KPI y con el CSV descargado.
+    # =========================================================
+    if "SOT" in df.columns:
+        base_export = df.drop_duplicates(subset=["SOT"]).reset_index(drop=True).copy()
+    else:
+        base_export = df.reset_index(drop=True).copy()
+
+    pagadas_export = (
+        base_export[base_export["Estado Segunda Caída"] == "PAGADA EN 3 MESES"]
+        .drop_duplicates(subset=["SOT"] if "SOT" in base_export.columns else None)
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    pendientes_export = (
+        base_export[base_export["Estado Segunda Caída"] == "PENDIENTE"]
+        .drop_duplicates(subset=["SOT"] if "SOT" in base_export.columns else None)
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    total_base = int(base_export["SOT"].nunique()) if "SOT" in base_export.columns else int(len(base_export))
+    pagadas = int(pagadas_export["SOT"].nunique()) if "SOT" in pagadas_export.columns else int(len(pagadas_export))
+    pendientes = int(pendientes_export["SOT"].nunique()) if "SOT" in pendientes_export.columns else int(len(pendientes_export))
+
+    pct_base = 100.00 if total_base > 0 else 0.00
+    pct_recuperacion = (pagadas / total_base * 100) if total_base > 0 else 0
+    pct_caida = (pendientes / total_base * 100) if total_base > 0 else 0
+    comision_recuperada = pd.to_numeric(pagadas_export.get("COMISION_RECUPERADA", 0), errors="coerce").fillna(0).sum()
+
+    st.markdown("### 📌 Indicadores Com.Indirecta 2da Etapa")
+    st.caption("Los indicadores se calculan con los filtros aplicados y a nivel SOT único.")
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    _kpi_card_html(k1, "Base CLARO_DC_FIJA", f"{total_base:,}", "Efectividad base 100%", "#0f4287", "#0f4287")
+    _kpi_card_html(k2, "Segunda Caída", f"{pagadas:,}", f"Alcance {pct_recuperacion:.2f}%", "#16a34a", "#16a34a")
+    _kpi_card_html(k3, "Pendientes", f"{pendientes:,}", f"Caída {pct_caida:.2f}%", "#dc2626", "#dc2626")
+    _kpi_card_html(k4, "COM ETAPA", formatear_moneda(comision_recuperada), "Comisión recuperada", "#7c3aed", "#7c3aed")
+    _kpi_card_html(k5, "% Caída", f"{pct_caida:.2f}%", "Pendientes / Base", "#ea580c", "#ea580c")
+
+    st.write("---")
+    st.markdown("### 🔎 Detalle desplegable")
+    st.caption("El desplegable muestra exactamente la misma base final que se descarga en CSV.")
+
+    filtro_txt = f"Base: {filtro_mes_base} | Supervisor: {filtro_supervisor}"
+    sufijo_supervisor = str(filtro_supervisor).replace(" ", "_").replace("/", "_")
+
+    with st.expander(f"➕ 0 | Base CLARO_DC_FIJA | Clientes/SOT base: {total_base:,} | Efectividad: {pct_base:.2f}%", expanded=False):
+        if base_export.empty:
+            st.info("No hay clientes/SOT en la base con los filtros seleccionados.")
+        else:
+            base_show = _ordenar_columnas_segunda_caida(base_export.copy())
+            st.dataframe(base_show, use_container_width=True, height=430)
+            nombre_archivo = f"segunda_caida_fija_dc_base_{filtro_mes_base.replace(' ','_')}_{sufijo_supervisor}.csv"
+            st.download_button(
+                "⬇️ Descargar base CLARO_DC_FIJA",
+                data=base_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name=nombre_archivo,
+                mime="text/csv",
+                key="dl_segunda_caida_dc_base",
+                on_click=registrar_descarga,
+                args=("F - COM.INDIRECTA 2da ETAPA - Base", nombre_archivo, filtro_txt)
+            )
+
+    with st.expander(f"➕ 1 | Pagadas en 3 meses | Cruzan y APLICA = SI: {pagadas:,} | Alcance: {pct_recuperacion:.2f}% | COM ETAPA: {formatear_moneda(comision_recuperada)}", expanded=False):
+        if pagadas_export.empty:
+            st.info("No hay ventas pagadas en 3 meses con APLICA = SI para los filtros seleccionados.")
+        else:
+            pagadas_show = _ordenar_columnas_segunda_caida(pagadas_export.copy())
+            st.dataframe(pagadas_show, use_container_width=True, height=430)
+            nombre_archivo = f"segunda_caida_fija_dc_pagadas_aplica_si_{filtro_mes_base.replace(' ','_')}_{sufijo_supervisor}.csv"
+            st.download_button(
+                "⬇️ Descargar pagadas en 3 meses",
+                data=pagadas_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name=nombre_archivo,
+                mime="text/csv",
+                key="dl_segunda_caida_dc_pagadas",
+                on_click=registrar_descarga,
+                args=("F - COM.INDIRECTA 2da ETAPA - Pagadas Aplica SI", nombre_archivo, filtro_txt)
+            )
+
+    with st.expander(f"➕ 2 | Pendientes | No aparecen o APLICA = NO: {pendientes:,} | Caída: {pct_caida:.2f}%", expanded=False):
+        if pendientes_export.empty:
+            st.success("No hay pendientes con los filtros seleccionados.")
+        else:
+            pendientes_show = _ordenar_columnas_segunda_caida(pendientes_export.copy())
+            st.dataframe(pendientes_show, use_container_width=True, height=430)
+            nombre_archivo = f"segunda_caida_fija_dc_pendientes_{filtro_mes_base.replace(' ','_')}_{sufijo_supervisor}.csv"
+            st.download_button(
+                "⬇️ Descargar pendientes",
+                data=pendientes_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name=nombre_archivo,
+                mime="text/csv",
+                key="dl_segunda_caida_dc_pendientes",
+                on_click=registrar_descarga,
+                args=("F - COM.INDIRECTA 2da ETAPA - Pendientes", nombre_archivo, filtro_txt)
+            )
+
+    st.write("---")
+    st.markdown(
+        f"""
+        <div style="background:rgba(255,255,255,.92);border:1px solid #dbeafe;border-left:6px solid #0f4287;
+        padding:14px 16px;border-radius:14px;color:#0f172a;font-size:13px;">
+            <b>Lectura rápida:</b> Base: <b>{total_base:,}</b> · Supervisor: <b>{filtro_supervisor}</b> ·
+            Pagadas APLICA = SI: <b>{pagadas:,}</b> · Pendientes: <b>{pendientes:,}</b> ·
+            Alcance: <b>{pct_recuperacion:.2f}%</b> · Caída: <b>{pct_caida:.2f}%</b> ·
+            COM ETAPA: <b>{formatear_moneda(comision_recuperada)}</b>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 def mostrar_detalle_fija_general():
     color_titulo = "#004a99"; color_borde = "#0f4287"
     set_bg(img_caratula)
@@ -962,13 +1448,14 @@ def mostrar_detalle_fija_general():
     st.markdown(f'<div style="color:{color_titulo};font-weight:800;font-size:16px;margin-bottom:16px;">D&C + TELETALK · BASE DEVELZ COMPLETA · CAÍDA REAL · PAGADA VS CAÍDA</div>', unsafe_allow_html=True)
     st.write("---")
 
-    col_f1,col_f2,col_f3,col_f4,col_f5 = st.columns([1.2,1.1,1.1,1.4,1.6])
-    with col_f1: filtro_mes   = st.selectbox("Fecha de Instalación", obtener_meses_fija("FECHA INSTALACION"), key="det_general_mes")
-    with col_f2: filtro_canal = st.selectbox("Canal", ["Todos","D&C","Teletalk"], key="det_general_canal")
-    with col_f3: filtro_estado= st.selectbox("Estado de Pago", ["Todos","PAGADA","CAÍDA"], key="det_general_estado")
+    col_f1,col_f2,col_f3,col_f4,col_f5,col_f6 = st.columns([1.2,1.2,1.0,1.1,1.4,1.6])
+    with col_f1: filtro_mes = st.selectbox("Fecha de Instalación", obtener_meses_fija("FECHA INSTALACION"), key="det_general_mes")
+    with col_f2: filtro_fecha_venta = st.selectbox("Fecha de Venta", obtener_meses_fija_develz("FECHA DE VENTA"), key="det_general_fecha_venta")
+    with col_f3: filtro_canal = st.selectbox("Canal", ["Todos","D&C","Teletalk"], key="det_general_canal")
+    with col_f4: filtro_estado= st.selectbox("Estado de Pago", ["Todos","PAGADA","CAÍDA"], key="det_general_estado")
 
     with st.spinner("Cargando todas las ventas desde DEVELZ y cruzando con Claro..."):
-        df_det = construir_detalle_fija_general(filtro_mes)
+        df_det = construir_detalle_fija_general(filtro_mes, filtro_fecha_venta)
 
     if df_det.empty:
         st.warning("No se encontraron datos. Verifica que FIJA_DC.csv, FIJA_TELETALK.csv y los archivos Claro estén en la carpeta correcta.")
@@ -980,9 +1467,9 @@ def mostrar_detalle_fija_general():
         df_det.loc[df_det["TIPIS"].eq(""), "TIPIS"] = "Sin TIPIS"
     else: df_det["TIPIS"] = "Sin TIPIS"
 
-    with col_f4:
-        filtro_supervisor = st.selectbox("Supervisor", ["Todos"] + sorted(df_det["SUPERVISOR"].fillna("Sin Supervisor").unique().tolist()), key="det_general_supervisor")
     with col_f5:
+        filtro_supervisor = st.selectbox("Supervisor", ["Todos"] + sorted(df_det["SUPERVISOR"].fillna("Sin Supervisor").unique().tolist()), key="det_general_supervisor")
+    with col_f6:
         filtro_tipificacion = st.selectbox("Tipificación", ["Todos"] + sorted(df_det["TIPIS"].fillna("Sin TIPIS").astype(str).unique().tolist()), key="det_general_tipificacion")
 
     df_filtrado = df_det.copy()
@@ -1000,7 +1487,7 @@ def mostrar_detalle_fija_general():
     _kpi_card_html(k5,"Comisión Total",formatear_moneda(comision),"Pagada",     color_borde, color_borde)
     st.write("---")
 
-    tab1,tab2,tab3,tab4,tab5 = st.tabs(["📋 Detalle Ventas","📆 Ventas por Día","🏆 Ranking Asesores","📍 Ranking Departamentos","📊 Estados Operativos"])
+    tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(["📋 Detalle Ventas","📆 Ventas por Día","🏆 Ranking Supervisor","👥 Ranking Asesores","📍 Ranking Departamentos","📊 Estados Operativos"])
 
     with tab1:
         st.markdown("#### Detalle de ventas DEVELZ con estado final")
@@ -1008,8 +1495,8 @@ def mostrar_detalle_fija_general():
             if val == "PAGADA": return "background-color:#dcfce7;color:#166534;font-weight:700"
             if val == "CAÍDA":  return "background-color:#fee2e2;color:#991b1b;font-weight:700"
             return ""
-        cols_mostrar = ["Canal","SOT","Documento","SUPERVISOR","Nombre del Cliente","Departamento",
-                        "FECHA INSTALACION","TIPIS","Estado Operativo","COMISION","Estado Pago"]
+        cols_mostrar = ["Canal","SOT","Documento","SUPERVISOR","ASESOR","Nombre del Cliente","Departamento",
+                        "FECHA INSTALACION","FECHA DE VENTA","TIPIS","Estado Operativo","COMISION","Estado Pago"]
         for col in cols_mostrar:
             if col not in df_filtrado.columns: df_filtrado[col] = ""
         df_show = df_filtrado[cols_mostrar].copy()
@@ -1017,8 +1504,10 @@ def mostrar_detalle_fija_general():
         st.dataframe(df_show.style.map(_colorear_estado, subset=["Estado Pago"]), use_container_width=True, height=450)
         csv_export = df_filtrado.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button("⬇️ Descargar CSV completo", data=csv_export,
-            file_name=f"detalle_fija_develz_{filtro_mes.replace(' ','_')}_{filtro_canal}.csv",
-            mime="text/csv", key="dl_det_general")
+            file_name=f"detalle_fija_develz_{filtro_mes.replace(' ','_')}_venta_{filtro_fecha_venta.replace(' ','_')}_{filtro_canal}.csv",
+            mime="text/csv", key="dl_det_general",
+            on_click=registrar_descarga,
+            args=("Detalle Fija General", f"detalle_fija_develz_{filtro_mes.replace(' ','_')}_venta_{filtro_fecha_venta.replace(' ','_')}_{filtro_canal}.csv", f"Instalación: {filtro_mes} | Venta: {filtro_fecha_venta} | Canal: {filtro_canal}"))
         mostrar_claro_pagado_no_develz(filtro_mes, filtro_canal)
 
     with tab2:
@@ -1080,10 +1569,24 @@ def mostrar_detalle_fija_general():
                 st.dataframe(pd.concat([tabla_dia,total_row],ignore_index=True), use_container_width=True, height=420)
 
     with tab3:
-        st.markdown("#### Ranking de Supervisores — PAGADA vs CAÍDA")
+        st.markdown("#### Ranking Supervisor — PAGADA vs CAÍDA")
         mostrar_ranking_supervisores_con_asesores(df_filtrado)
 
     with tab4:
+        st.markdown("#### Ranking de Asesores — solo asesores")
+        ranking_asesores = ranking_asesores_fija_develz(df_filtrado)
+        if ranking_asesores.empty:
+            st.warning("No se encontraron datos para el ranking de asesores.")
+        else:
+            st.dataframe(
+                ranking_asesores.style.format({"Comision": lambda x: formatear_moneda(x) if isinstance(x, (int, float)) else x})
+                .set_properties(**{"text-align":"center"})
+                .set_properties(subset=["ASESOR"], **{"text-align":"left"}),
+                use_container_width=True,
+                height=460
+            )
+
+    with tab5:
         st.markdown("#### Ranking por Departamento de Instalación")
         st.caption("Fuente: columna `Datos Instalación - Departamento` de DEVELZ")
         rank_dpto = ranking_departamentos_df(df_filtrado)
@@ -1104,7 +1607,7 @@ def mostrar_detalle_fija_general():
             st.markdown("**Tabla de detalle por departamento**")
             st.table(rank_dpto)
 
-    with tab5:
+    with tab6:
         st.markdown("#### Estados Operativos (TIPIS agrupado)")
         estados_df = estados_operativos_df(df_filtrado)
         if estados_df.empty: st.warning("No se encontraron datos de TIPIS.")
@@ -1704,7 +2207,9 @@ def mostrar_resumen_etapas_expandible_teletalk(df, resumen, filtro_mes):
                 data=_excel_bytes_teletalk_etapa(detalle),
                 file_name=f"teletalk_movil_{archivo_etapa}_{archivo_mes}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_excel_tt_movil_{archivo_etapa}_{archivo_mes}"
+                key=f"dl_excel_tt_movil_{archivo_etapa}_{archivo_mes}",
+                on_click=registrar_descarga,
+                args=("Teletalk Móvil por Etapa", f"teletalk_movil_{archivo_etapa}_{archivo_mes}.xlsx", f"Etapa: {etapa} | Mes: {filtro_mes}")
             )
 
 
@@ -2015,7 +2520,9 @@ def mostrar_detalle_movil_general():
                 data=df_caidas.drop(columns=["_FECHA_ORIGINAL_DT", "_FECHA_BASE_DT"], errors="ignore").to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
                 file_name=f"teletalk_movil_2da_3ra_caida_{filtro_mes.replace(' ', '_')}.csv",
                 mime="text/csv",
-                key="dl_tt_movil_2da_3ra"
+                key="dl_tt_movil_2da_3ra",
+                on_click=registrar_descarga,
+                args=("Teletalk Móvil 2da y 3ra Caída", f"teletalk_movil_2da_3ra_caida_{filtro_mes.replace(' ', '_')}.csv", f"Mes: {filtro_mes}")
             )
 
     with tab3:
@@ -2043,18 +2550,275 @@ def mostrar_detalle_movil_general():
             data=df_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
             file_name=f"detalle_movil_teletalk_cruce_numero_{filtro_mes.replace(' ', '_')}.csv",
             mime="text/csv",
-            key="dl_tt_movil_base_filtrada"
+            key="dl_tt_movil_base_filtrada",
+            on_click=registrar_descarga,
+            args=("Detalle Móvil Teletalk", f"detalle_movil_teletalk_cruce_numero_{filtro_mes.replace(' ', '_')}.csv", f"Mes: {filtro_mes}")
         )
 
+
+
+# =========================================================
+# 10B. LOGIN / SEGURIDAD DE ACCESO
+# =========================================================
+def login_inicio():
+    set_bg(img_caratula)
+
+    if "login_ok" not in st.session_state:
+        st.session_state["login_ok"] = False
+
+    if st.session_state["login_ok"]:
+        return True
+
+    st.markdown("""
+    <style>
+        section[data-testid="stSidebar"] {display:none !important;}
+        div[data-testid="collapsedControl"] {display:none !important;}
+        header[data-testid="stHeader"] {background: transparent !important;}
+        .block-container {
+            padding-top: 2.2rem !important;
+            max-width: 1180px !important;
+        }
+        .login-shell {
+            min-height: 78vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-panel {
+            width: 100%;
+            background: linear-gradient(135deg, rgba(255,255,255,.94), rgba(241,247,255,.88));
+            border: 1px solid rgba(255,255,255,.70);
+            border-radius: 34px;
+            box-shadow: 0 32px 90px rgba(15, 66, 135, .24), 0 12px 32px rgba(0,0,0,.16);
+            overflow: hidden;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            display: grid;
+            grid-template-columns: 1.05fr .95fr;
+            min-height: 570px;
+        }
+        .login-brand {
+            position: relative;
+            padding: 48px 46px;
+            color: white;
+            background:
+                radial-gradient(circle at 18% 18%, rgba(74,144,226,.55), transparent 28%),
+                radial-gradient(circle at 80% 72%, rgba(147,51,234,.35), transparent 30%),
+                linear-gradient(145deg, rgba(10,37,75,.96), rgba(15,66,135,.94) 55%, rgba(8,27,58,.98));
+        }
+        .login-brand::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,.10) 45%, transparent 70%);
+            pointer-events: none;
+        }
+        .login-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 14px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.14);
+            border: 1px solid rgba(255,255,255,.26);
+            font-size: 12px;
+            font-weight: 900;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            margin-bottom: 30px;
+        }
+        .login-main-title {
+            font-size: 46px;
+            line-height: 1.02;
+            font-weight: 950;
+            margin: 0 0 16px 0;
+            letter-spacing: -.04em;
+        }
+        .login-main-subtitle {
+            font-size: 16px;
+            line-height: 1.55;
+            color: rgba(255,255,255,.82);
+            max-width: 430px;
+            margin-bottom: 34px;
+            font-weight: 600;
+        }
+        .login-feature-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-top: 34px;
+        }
+        .login-feature {
+            background: rgba(255,255,255,.12);
+            border: 1px solid rgba(255,255,255,.18);
+            border-radius: 18px;
+            padding: 16px;
+        }
+        .login-feature strong {
+            display: block;
+            font-size: 18px;
+            font-weight: 950;
+            margin-bottom: 4px;
+        }
+        .login-feature span {
+            display: block;
+            font-size: 12px;
+            font-weight: 700;
+            color: rgba(255,255,255,.72);
+        }
+        .login-form-area {
+            padding: 46px 44px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .login-form-card {
+            background: rgba(255,255,255,.86);
+            border: 1px solid rgba(15,66,135,.10);
+            border-radius: 28px;
+            padding: 30px 28px 26px 28px;
+            box-shadow: 0 18px 45px rgba(15,66,135,.10);
+        }
+        .login-form-title {
+            color: #0f4287;
+            font-size: 30px;
+            font-weight: 950;
+            letter-spacing: -.03em;
+            margin-bottom: 6px;
+            text-align: left;
+        }
+        .login-form-subtitle {
+            color: #64748b;
+            font-size: 14px;
+            font-weight: 700;
+            line-height: 1.45;
+            margin-bottom: 24px;
+            text-align: left;
+        }
+        div[data-testid="stTextInput"] label {
+            color: #334155 !important;
+            font-weight: 900 !important;
+            font-size: 13px !important;
+            letter-spacing: .04em;
+        }
+        div[data-testid="stTextInput"] input {
+            border-radius: 15px !important;
+            border: 1px solid rgba(15,66,135,.18) !important;
+            background: #f8fafc !important;
+            min-height: 48px !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stTextInput"] input:focus {
+            border-color: #2563eb !important;
+            box-shadow: 0 0 0 3px rgba(37,99,235,.14) !important;
+        }
+        .stButton > button {
+            background: linear-gradient(135deg, #0f4287, #2563eb) !important;
+            color: white !important;
+            border: 0 !important;
+            border-radius: 16px !important;
+            min-height: 50px !important;
+            font-weight: 950 !important;
+            letter-spacing: .04em !important;
+            box-shadow: 0 16px 30px rgba(37,99,235,.24) !important;
+            transition: transform .15s ease, box-shadow .15s ease !important;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 20px 38px rgba(37,99,235,.32) !important;
+        }
+        .login-footnote {
+            margin-top: 18px;
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: #eff6ff;
+            border: 1px solid #dbeafe;
+            color: #1e3a8a;
+            font-size: 12px;
+            font-weight: 800;
+            text-align: center;
+        }
+        @media (max-width: 900px) {
+            .login-panel { grid-template-columns: 1fr; }
+            .login-brand { padding: 34px 28px; }
+            .login-form-area { padding: 28px; }
+            .login-main-title { font-size: 36px; }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="login-shell">
+        <div class="login-panel">
+            <div class="login-brand">
+                <div class="login-badge">🔐 Acceso privado</div>
+                <h1 class="login-main-title">Dashboard Teletalk Digital</h1>
+                <div class="login-main-subtitle">
+                    Plataforma ejecutiva para seguimiento de ventas, comisiones, efectividad comercial y control operativo.
+                </div>
+                <div class="login-feature-grid">
+                    <div class="login-feature"><strong>Fija</strong><span>Instalación, venta y rankings</span></div>
+                    <div class="login-feature"><strong>Móvil</strong><span>Portabilidad, altas y detalle</span></div>
+                    <div class="login-feature"><strong>KPI</strong><span>Indicadores gerenciales</span></div>
+                    <div class="login-feature"><strong>Control</strong><span>Acceso protegido</span></div>
+                </div>
+            </div>
+            <div class="login-form-area">
+                <div class="login-form-card">
+                    <div class="login-form-title">Iniciar sesión</div>
+                    <div class="login-form-subtitle">Ingresa tus credenciales autorizadas para continuar.</div>
+    """, unsafe_allow_html=True)
+
+    USUARIOS = {
+        "Fiorella": "F10r3LLa123*",
+        "LuisT": "Corp.LT_2026!k",
+        "Isabel": "Corp.I_2026!k",
+        "DavidG": "Corp.DG_2026!k",
+        "JoseM": "Corp.JM_2026!k"
+    }
+
+    usuario = st.selectbox(
+        "Usuario",
+        [""] + list(USUARIOS.keys()),
+        key="login_usuario",
+        placeholder="Selecciona tu usuario"
+    )
+    password = st.text_input("Contraseña", type="password", key="login_password", placeholder="Ingresa tu contraseña")
+
+    if st.button("Ingresar al dashboard", use_container_width=True):
+        if usuario in USUARIOS and password == USUARIOS[usuario]:
+            st.session_state["login_ok"] = True
+            st.session_state["usuario_logueado"] = usuario
+            st.rerun()
+        else:
+            st.error("Usuario o contraseña incorrectos.")
+
+    st.markdown("""
+                    <div class="login-footnote">Sistema protegido · Uso interno autorizado</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.stop()
+
+login_inicio()
 
 # =========================================================
 # 11. SIDEBAR / NAVEGACIÓN
 # =========================================================
 OPCIONES_FIJA = [
     "Inicio: Reporte Comparativo","Detalle Fija General",
-    "D&C Factor Instalación","D&C Factor F. Venta","D&C IAE ASESOR",
-    "Teletalk Factor Instalación","Teletalk Factor F. Venta","Teletalk IAE ASESOR",
+    "F - COM.INDIRECTA 2da ETAPA",
+    "D&C Factor Instalación","D&C Factor F. Venta",
+    "Teletalk Factor Instalación","Teletalk Factor F. Venta",
 ]
+
+# La auditoría queda oculta para todos y solo aparece al administrador Fiorella.
+if st.session_state.get("usuario_logueado", "") == "Fiorella":
+    OPCIONES_FIJA.append("🔒 Auditoría Descargas")
+
 OPCIONES_MOVIL = [
     "Inicio: Reporte Comparativo MOVIL","Detalle Móvil General",
     "D&C Factor F. Venta MOVIL","D&C IAE ASESOR MOVIL",
@@ -2093,7 +2857,7 @@ opcion_movil = seleccion if seleccion in OPCIONES_MOVIL else "Inicio: Reporte Co
 seccion      = "movil" if seleccion in OPCIONES_MOVIL else "fija"
 
 with st.sidebar.expander("🔍 Ver columnas de CSVs"):
-    for nombre in ["FIJA_DC.csv","FIJA_TELETALK.csv","CLARO_DC_FIJA.csv","CLARO_TELETALK_FIJA.csv","CLARO_DC_MOVIL.csv","CLARO_TELETALK_MOVIL.csv"]:
+    for nombre in ["FIJA_DC.csv","FIJA_TELETALK.csv","CLARO_DC_FIJA.csv","CLARO_DC_FIJA_SEGUNDA_CAIDA.csv","CLARO_TELETALK_FIJA.csv","CLARO_DC_MOVIL.csv","CLARO_TELETALK_MOVIL.csv"]:
         df_test = cargar_csv(nombre)
         if not df_test.empty: st.write(f"**{nombre}:**"); st.write(list(df_test.columns))
         else: st.write(f"**{nombre}:** ❌ no cargado")
@@ -2103,7 +2867,10 @@ with st.sidebar.expander("🔍 Ver columnas de CSVs"):
 # =========================================================
 if seccion == "fija":
 
-    if opcion == "Inicio: Reporte Comparativo":
+    if opcion == "🔒 Auditoría Descargas":
+        mostrar_auditoria_descargas()
+
+    elif opcion == "Inicio: Reporte Comparativo":
         set_bg(img_caratula)
         st.markdown('<div class="main-title">REPORTE COMPARATIVO</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-title">D&C DIGITAL GROUP <span style="color:black">vs</span> <span style="color:#70008f">TELETALK CONTACT CENTER</span></div>', unsafe_allow_html=True)
@@ -2123,6 +2890,9 @@ if seccion == "fija":
     elif opcion == "Detalle Fija General":
         mostrar_detalle_fija_general()
 
+    elif opcion == "F - COM.INDIRECTA 2da ETAPA":
+        mostrar_segunda_caida_fija_dc()
+
     elif opcion == "D&C Factor Instalación":
         set_bg(img_dc)
         st.markdown('<div class="section-title-dc">D&C Factor Instalación</div>', unsafe_allow_html=True)
@@ -2138,14 +2908,6 @@ if seccion == "fija":
         st.write("---")
         filtro = st.selectbox("Fecha de Venta", obtener_meses_fija("FECHA GENERACION"), key="dc_fv_gene")
         mostrar_factor_fija("dbo.CLARO_DC_FIJA", "FECHA GENERACION", filtro, "dc")
-
-    elif opcion == "D&C IAE ASESOR":
-        set_bg(img_dc)
-        st.markdown('<div class="section-title-dc">D&C IAE ASESOR</div>', unsafe_allow_html=True)
-        st.markdown('<div class="small-subtitle-dc">BASE FIJA_DC · ASESOR = CREADOR · CRUCE SOT CON CLARO_DC_FIJA</div>', unsafe_allow_html=True)
-        st.write("---")
-        filtro = st.selectbox("Fecha de Instalación", obtener_meses_fija("FECHA INSTALACION"), key="dc_iae_inst")
-        mostrar_iae_asesor_fija_develz("[DATA DEVELZ].dbo.FIJA_DC","dbo.CLARO_DC_FIJA","D&C",filtro,"dc_iae_asesor","dc")
 
     elif opcion == "Teletalk Factor Instalación":
         set_bg(img_tt)
@@ -2163,13 +2925,6 @@ if seccion == "fija":
         filtro = st.selectbox("Fecha de Venta", obtener_meses_fija("FECHA GENERACION"), key="tt_fv_gene")
         mostrar_factor_fija("dbo.CLARO_TELETALK_FIJA","FECHA GENERACION",filtro,"tt")
 
-    elif opcion == "Teletalk IAE ASESOR":
-        set_bg(img_tt)
-        st.markdown('<div class="section-title-tt">Teletalk IAE ASESOR</div>', unsafe_allow_html=True)
-        st.markdown('<div class="small-subtitle-tt">BASE FIJA_TELETALK · ASESOR = CREADOR · CRUCE SOT CON CLARO_TELETALK_FIJA</div>', unsafe_allow_html=True)
-        st.write("---")
-        filtro = st.selectbox("Fecha de Instalación", obtener_meses_fija("FECHA INSTALACION"), key="tt_iae_inst")
-        mostrar_iae_asesor_fija_develz("[DATA DEVELZ].dbo.FIJA_TELETALK","dbo.CLARO_TELETALK_FIJA","Teletalk",filtro,"tt_iae_asesor","tt")
 
 # =========================================================
 # 13. VISTAS MÓVIL
