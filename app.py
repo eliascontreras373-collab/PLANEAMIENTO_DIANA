@@ -600,16 +600,39 @@ def _normalizar_sot_series(serie):
     Corrige casos como:
     - 87274852.0  -> 87274852
     - 87274852    -> 87274852
-    - espacios invisibles
+    - espacios invisibles / caracteres raros
     - valores nulos
+    - SOT con guiones o separadores
+
+    IMPORTANTE:
+    Esta función se usa para mostrar la SOT limpia.
+    Para comparar de forma más agresiva se usa _sot_key_series().
     """
     s = serie.fillna("").astype(str).str.strip()
     s = s.str.replace("\\u00a0", "", regex=False)
+    s = s.str.replace("\ufeff", "", regex=False)
     s = s.str.replace(r"\s+", "", regex=True)
-    s = s.str.replace(r"\.0$", "", regex=True)
-    s = s.str.replace(r"\.00$", "", regex=True)
+    s = s.str.replace(r"\.0+$", "", regex=True)
+    s = s.str.replace(r"^'", "", regex=True)
     s = s.replace(["nan","NaN","None","NONE","null","NULL","NaT","<NA>"], "")
     return s
+
+def _sot_key_series(serie):
+    """
+    Llave técnica SOLO para cruces SOT.
+    Evita falsos faltantes cuando una base trae la SOT como texto, número,
+    decimal, con espacios, guiones o caracteres invisibles.
+
+    Ejemplos que quedan iguales:
+    - 87274852
+    - 87274852.0
+    - 87 274 852
+    - 87-274-852
+    """
+    s = _normalizar_sot_series(serie)
+    s = s.str.replace(r"[^0-9]", "", regex=True)
+    s = s.str.lstrip("0")
+    return s.replace(["nan","NaN","None","NONE","null","NULL","NaT","<NA>"], "")
 
 # --- Obtención de campos DEVELZ ---
 def _obtener_sot_develz(df):
@@ -758,24 +781,273 @@ def kpi_detalle_fija(df):
     return total, pagadas, caidas, comision, (pagadas / total * 100) if total > 0 else 0
 
 def ranking_departamentos_df(df):
-    if df.empty or "Departamento" not in df.columns: return pd.DataFrame()
-    grp = df.groupby("Departamento").agg(
-        Total=("Estado Pago","count"),
-        Pagadas=("Estado Pago", lambda x: (x == "PAGADA").sum()),
-        Caidas=("Estado Pago", lambda x: (x == "CAÍDA").sum()),
-        Comision=("COMISION", lambda x: pd.to_numeric(x, errors="coerce").fillna(0).sum()),
-    ).reset_index().sort_values("Pagadas", ascending=False)
-    tot_v = grp["Total"].sum(); tot_p = grp["Pagadas"].sum()
-    tot_c = grp["Caidas"].sum(); tot_com = pd.to_numeric(grp["Comision"], errors="coerce").fillna(0).sum()
-    grp["% Participación"] = ((grp["Pagadas"] / tot_p * 100).round(2).astype(str) + "%" if tot_p > 0 else "0%")
-    grp["% Efectividad"] = (grp["Pagadas"] / grp["Total"] * 100).round(2).astype(str) + "%"
-    grp["Comision"] = grp["Comision"].map(formatear_moneda)
-    total_row = pd.DataFrame([{"Departamento":"TOTAL","Total":tot_v,"Pagadas":tot_p,"Caidas":tot_c,
-        "Comision":formatear_moneda(tot_com),
-        "% Participación":"100.00%" if tot_p > 0 else "0%",
-        "% Efectividad":f"{(tot_p/tot_v*100):.2f}%" if tot_v > 0 else "0%"}])
-    return pd.concat([grp, total_row], ignore_index=True)[
-        ["Departamento","Total","Pagadas","Caidas","Comision","% Participación","% Efectividad"]]
+    """
+    Ranking gerencial por departamento.
+    Mantiene la lógica original:
+    - Total = cantidad de registros DEVELZ filtrados
+    - Pagadas = Estado Pago == PAGADA
+    - Caidas = Estado Pago == CAÍDA
+    - Comisión = suma de COMISION
+    """
+    cols = ["Rank", "Departamento", "Total", "Pagadas", "Caidas", "Comision", "% Participación", "% Efectividad"]
+
+    if df.empty or "Departamento" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    base = df.copy()
+    base["Departamento"] = base["Departamento"].fillna("Sin Departamento").astype(str).str.strip()
+    base.loc[base["Departamento"].eq(""), "Departamento"] = "Sin Departamento"
+    base["COMISION"] = pd.to_numeric(base.get("COMISION", 0), errors="coerce").fillna(0)
+
+    grp = (
+        base.groupby("Departamento", dropna=False)
+        .agg(
+            Total=("Estado Pago", "count"),
+            Pagadas=("Estado Pago", lambda x: (x == "PAGADA").sum()),
+            Caidas=("Estado Pago", lambda x: (x == "CAÍDA").sum()),
+            Comision=("COMISION", "sum"),
+        )
+        .reset_index()
+    )
+
+    total_ventas = int(grp["Total"].sum())
+    total_pagadas = int(grp["Pagadas"].sum())
+    total_caidas = int(grp["Caidas"].sum())
+    total_comision = float(pd.to_numeric(grp["Comision"], errors="coerce").fillna(0).sum())
+
+    grp["% Participación"] = (grp["Pagadas"] / total_pagadas * 100).round(2) if total_pagadas > 0 else 0.0
+    grp["% Efectividad"] = (grp["Pagadas"] / grp["Total"] * 100).round(2).fillna(0)
+
+    grp = grp.sort_values(["Pagadas", "Comision", "Total"], ascending=[False, False, False]).reset_index(drop=True)
+    grp.insert(0, "Rank", grp.index + 1)
+
+    total_row = pd.DataFrame([{
+        "Rank": "TOTAL",
+        "Departamento": "",
+        "Total": total_ventas,
+        "Pagadas": total_pagadas,
+        "Caidas": total_caidas,
+        "Comision": total_comision,
+        "% Participación": 100.00 if total_pagadas > 0 else 0.00,
+        "% Efectividad": round((total_pagadas / total_ventas * 100), 2) if total_ventas > 0 else 0.00,
+    }])
+
+    return pd.concat([grp[cols], total_row[cols]], ignore_index=True)
+
+
+def mostrar_ranking_departamentos_premium(df):
+    """Vista premium gerencial para el tab 📍 Ranking Departamentos."""
+    rank_dpto = ranking_departamentos_df(df)
+
+    if rank_dpto.empty:
+        st.warning("No se encontró columna de departamento.")
+        return
+
+    base = rank_dpto[rank_dpto["Rank"].astype(str) != "TOTAL"].copy()
+    total = rank_dpto[rank_dpto["Rank"].astype(str) == "TOTAL"].copy()
+
+    total_departamentos = int(base["Departamento"].nunique()) if not base.empty else 0
+    total_ventas = int(total["Total"].iloc[0]) if not total.empty else int(base["Total"].sum())
+    total_pagadas = int(total["Pagadas"].iloc[0]) if not total.empty else int(base["Pagadas"].sum())
+    total_caidas = int(total["Caidas"].iloc[0]) if not total.empty else int(base["Caidas"].sum())
+    total_comision = float(total["Comision"].iloc[0]) if not total.empty else float(pd.to_numeric(base["Comision"], errors="coerce").fillna(0).sum())
+    efectividad = (total_pagadas / total_ventas * 100) if total_ventas > 0 else 0
+
+    # KPI territorial: Lima vs Provincia.
+    # Se calcula sobre el total de ventas de cada departamento dentro de la base filtrada.
+    if not base.empty and "Departamento" in base.columns:
+        dep_norm = (
+            base["Departamento"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .str.replace("Á", "A", regex=False)
+            .str.replace("É", "E", regex=False)
+            .str.replace("Í", "I", regex=False)
+            .str.replace("Ó", "O", regex=False)
+            .str.replace("Ú", "U", regex=False)
+        )
+        mask_lima = dep_norm.str.contains("LIMA", na=False)
+        lima_total = int(pd.to_numeric(base.loc[mask_lima, "Total"], errors="coerce").fillna(0).sum())
+        provincia_total = int(pd.to_numeric(base.loc[~mask_lima, "Total"], errors="coerce").fillna(0).sum())
+    else:
+        lima_total = 0
+        provincia_total = 0
+
+    lima_pct = (lima_total / total_ventas * 100) if total_ventas > 0 else 0
+    provincia_pct = (provincia_total / total_ventas * 100) if total_ventas > 0 else 0
+
+    st.markdown("""
+    <style>
+        .dpto-premium-wrap{
+            background:linear-gradient(135deg, rgba(255,255,255,.98), rgba(239,246,255,.96));
+            border:1px solid rgba(15,66,135,.16);
+            border-radius:26px;
+            padding:24px 24px 18px 24px;
+            box-shadow:0 18px 50px rgba(15,66,135,.13);
+            margin-bottom:18px;
+        }
+        .dpto-premium-title{
+            font-size:34px;
+            font-weight:950;
+            color:#0f4287;
+            margin-bottom:4px;
+            letter-spacing:-.02em;
+        }
+        .dpto-premium-sub{
+            font-size:14px;
+            font-weight:700;
+            color:#64748b;
+            margin-bottom:18px;
+        }
+        .dpto-premium-note{
+            background:rgba(15,66,135,.08);
+            color:#0f4287;
+            border-left:5px solid #0f4287;
+            padding:10px 14px;
+            border-radius:12px;
+            font-size:13px;
+            font-weight:800;
+            margin-top:8px;
+        }
+        .dpto-kpi-card{
+            background:white;
+            border-radius:22px;
+            padding:18px 14px;
+            text-align:center;
+            border:1px solid rgba(15,66,135,.16);
+            box-shadow:0 10px 28px rgba(0,0,0,.08);
+            min-height:112px;
+        }
+        .dpto-kpi-label{
+            font-size:11px;
+            font-weight:900;
+            color:#64748b;
+            letter-spacing:.08em;
+            text-transform:uppercase;
+            margin-bottom:8px;
+        }
+        .dpto-kpi-value{
+            font-size:30px;
+            font-weight:950;
+            color:#0f4287;
+            line-height:1.05;
+        }
+        .dpto-kpi-sub{
+            font-size:11px;
+            font-weight:700;
+            color:#94a3b8;
+            margin-top:6px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="dpto-premium-wrap">
+        <div class="dpto-premium-title">📍 Ranking Departamentos</div>
+        <div class="dpto-premium-sub">Vista gerencial premium de ventas, pagos, caídas, comisión y efectividad por departamento.</div>
+        <div class="dpto-premium-note">Fuente: columna <b>Datos Instalación - Departamento</b> de DEVELZ, cruzado con estado de pago CLARO.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(f'<div class="dpto-kpi-card"><div class="dpto-kpi-label">Departamentos</div><div class="dpto-kpi-value">{total_departamentos:,}</div><div class="dpto-kpi-sub">zonas con gestión</div></div>', unsafe_allow_html=True)
+    with k2:
+        st.markdown(f'<div class="dpto-kpi-card"><div class="dpto-kpi-label">Lima</div><div class="dpto-kpi-value" style="color:#0f4287;">{lima_total:,}</div><div class="dpto-kpi-sub">{lima_pct:.2f}% del total</div></div>', unsafe_allow_html=True)
+    with k3:
+        st.markdown(f'<div class="dpto-kpi-card"><div class="dpto-kpi-label">Provincia</div><div class="dpto-kpi-value" style="color:#7c3aed;">{provincia_total:,}</div><div class="dpto-kpi-sub">{provincia_pct:.2f}% del total</div></div>', unsafe_allow_html=True)
+    with k4:
+        st.markdown(f'<div class="dpto-kpi-card"><div class="dpto-kpi-label">Efectividad</div><div class="dpto-kpi-value">{efectividad:.2f}%</div><div class="dpto-kpi-sub">pagadas / total</div></div>', unsafe_allow_html=True)
+
+    st.write("")
+
+    if not base.empty:
+        top = base.head(10).copy()
+        try:
+            import altair as alt
+            chart_data = top[["Departamento", "Pagadas", "Caidas"]].melt(
+                "Departamento",
+                var_name="Estado",
+                value_name="Cantidad"
+            )
+            chart = (
+                alt.Chart(chart_data)
+                .mark_bar(cornerRadiusEnd=6)
+                .encode(
+                    x=alt.X("Cantidad:Q", title="Ventas"),
+                    y=alt.Y("Departamento:N", sort="-x", title=""),
+                    color=alt.Color(
+                        "Estado:N",
+                        scale=alt.Scale(domain=["Pagadas", "Caidas"], range=["#059669", "#dc2626"]),
+                        legend=alt.Legend(title="Estado")
+                    ),
+                    tooltip=["Departamento", "Estado", "Cantidad"]
+                )
+                .properties(height=max(260, len(top) * 42), title="Top departamentos por ventas pagadas y caídas")
+                .configure_axis(labelFontSize=12, titleFontSize=13)
+                .configure_title(fontSize=18, fontWeight="bold", color="#0f4287")
+            )
+            st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            st.info("No se pudo renderizar el gráfico, pero la tabla gerencial está disponible abajo.")
+
+    tabla = rank_dpto.copy()
+    tabla["Comision"] = tabla["Comision"].apply(lambda x: formatear_moneda(x) if isinstance(x, (int, float)) else x)
+    tabla["% Participación"] = tabla["% Participación"].apply(lambda x: f"{float(x):.2f}%" if isinstance(x, (int, float)) else x)
+    tabla["% Efectividad"] = tabla["% Efectividad"].apply(lambda x: f"{float(x):.2f}%" if isinstance(x, (int, float)) else x)
+
+    st.markdown("#### Tabla gerencial por departamento")
+
+    # IMPORTANTE:
+    # No usamos Styler.background_gradient porque requiere matplotlib.
+    # Estos estilos son manuales y funcionan sin instalar paquetes adicionales.
+    def _color_pagadas(val):
+        try:
+            v = float(val)
+            max_v = float(pd.to_numeric(tabla["Pagadas"], errors="coerce").fillna(0).max())
+            intensidad = 0 if max_v == 0 else min(v / max_v, 1)
+            alpha = 0.10 + (intensidad * 0.28)
+            return f"background-color: rgba(5,150,105,{alpha}); color:#064e3b; font-weight:800; text-align:center;"
+        except Exception:
+            return "text-align:center;"
+
+    def _color_caidas(val):
+        try:
+            v = float(val)
+            max_v = float(pd.to_numeric(tabla["Caidas"], errors="coerce").fillna(0).max())
+            intensidad = 0 if max_v == 0 else min(v / max_v, 1)
+            alpha = 0.08 + (intensidad * 0.24)
+            return f"background-color: rgba(220,38,38,{alpha}); color:#7f1d1d; font-weight:800; text-align:center;"
+        except Exception:
+            return "text-align:center;"
+
+    def _resaltar_total(row):
+        if str(row.get("Rank", "")).upper() == "TOTAL":
+            return ["background-color:#0f4287; color:white; font-weight:900;" for _ in row]
+        return ["" for _ in row]
+
+    st.dataframe(
+        tabla.style
+        .apply(_resaltar_total, axis=1)
+        .map(_color_pagadas, subset=["Pagadas"])
+        .map(_color_caidas, subset=["Caidas"])
+        .set_properties(**{"text-align": "center", "font-size": "13px"})
+        .set_properties(subset=["Departamento"], **{"text-align": "left", "font-weight": "bold"}),
+        use_container_width=True,
+        height=min(650, 90 + 36 * len(tabla))
+    )
+
+    st.download_button(
+        "⬇️ Descargar Ranking Departamentos",
+        data=rank_dpto.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="ranking_departamentos_develz.csv",
+        mime="text/csv",
+        key="dl_ranking_departamentos_premium",
+        on_click=registrar_descarga,
+        args=("Ranking Departamentos", "ranking_departamentos_develz.csv", "Vista premium gerencial")
+    )
 
 def ranking_asesores_detalle(df):
     if df.empty or "SUPERVISOR" not in df.columns: return pd.DataFrame()
@@ -1016,23 +1288,53 @@ def obtener_claro_pagado_no_develz(filtro_mes, filtro_canal):
              ("Teletalk","[DATA DEVELZ].dbo.FIJA_TELETALK","dbo.CLARO_TELETALK_FIJA")]
     salida = []
     for canal, tabla_dev, tabla_claro in pares:
-        if filtro_canal != "Todos" and canal != filtro_canal: continue
-        dev   = _df_develz_para_conciliacion(tabla_dev, canal, filtro_mes)
-        claro = _df_claro_para_conciliacion(tabla_claro, canal, filtro_mes)
-        if claro.empty: continue
-        dev_sot = set(dev[dev["SOT"] != ""]["SOT"].unique()) if not dev.empty else set()
+        if filtro_canal != "Todos" and canal != filtro_canal:
+            continue
+
+        # ✅ CORRECCIÓN SENIOR:
+        # CLARO sí debe respetar el mes filtrado porque queremos revisar las ventas pagadas de ese periodo.
+        # Pero DEVELZ NO debe filtrarse por mes en este cruce de "no aparece", porque una SOT puede existir
+        # en DEVELZ con otra fecha de instalación/venta. Antes eso generaba falsos faltantes.
+        dev_total = _df_develz_para_conciliacion(tabla_dev, canal, "Todos los meses")
+        claro     = _df_claro_para_conciliacion(tabla_claro, canal, filtro_mes)
+
+        if claro.empty:
+            continue
+
+        # Llave técnica robusta para comparar SOT sin afectar cómo se muestra la SOT original limpia.
+        claro["_SOT_KEY"] = _sot_key_series(claro["SOT"])
+        if not dev_total.empty:
+            dev_total["_SOT_KEY"] = _sot_key_series(dev_total["SOT"])
+            dev_sot_keys = set(dev_total.loc[dev_total["_SOT_KEY"] != "", "_SOT_KEY"].unique())
+        else:
+            dev_sot_keys = set()
+
         claro["PAGADA_CLARO"] = (
-            (claro["Comisiones_Claro"].fillna("").astype(str).str.upper().str.strip() == "SI") |
-            (pd.to_numeric(claro["Comision_Claro"], errors="coerce").fillna(0) > 0))
-        faltantes = claro[(claro["PAGADA_CLARO"]) & (~claro["SOT"].isin(dev_sot))].copy()
+            (claro["Comisiones_Claro"].fillna("").astype(str).str.upper().str.strip().str.replace("Í","I",regex=False) == "SI") |
+            (pd.to_numeric(claro["Comision_Claro"], errors="coerce").fillna(0) > 0)
+        )
+
+        faltantes = claro[
+            (claro["PAGADA_CLARO"]) &
+            (claro["_SOT_KEY"] != "") &
+            (~claro["_SOT_KEY"].isin(dev_sot_keys))
+        ].copy()
+
         if not faltantes.empty:
             faltantes["Motivo"] = "Claro lo paga, pero el SOT no aparece en DEVELZ"
             salida.append(faltantes)
+
     if not salida:
         return pd.DataFrame(columns=["Canal","SOT","Fecha_Claro","Cliente","Documento","Comision_Claro","Comisiones_Claro","Motivo"])
+
     df_out = pd.concat(salida, ignore_index=True)
     for col in ["Cliente","Documento"]:
-        if col not in df_out.columns: df_out[col] = ""
+        if col not in df_out.columns:
+            df_out[col] = ""
+
+    if "_SOT_KEY" in df_out.columns:
+        df_out = df_out.drop(columns=["_SOT_KEY"], errors="ignore")
+
     return df_out[["Canal","SOT","Fecha_Claro","Cliente","Documento","Comision_Claro","Comisiones_Claro","Motivo"]]
 
 def mostrar_claro_pagado_no_develz(filtro_mes, filtro_canal):
@@ -1587,25 +1889,7 @@ def mostrar_detalle_fija_general():
             )
 
     with tab5:
-        st.markdown("#### Ranking por Departamento de Instalación")
-        st.caption("Fuente: columna `Datos Instalación - Departamento` de DEVELZ")
-        rank_dpto = ranking_departamentos_df(df_filtrado)
-        if rank_dpto.empty:
-            st.warning("No se encontró columna de departamento.")
-        else:
-            import altair as alt
-            df_chart = rank_dpto[rank_dpto["Departamento"] != "TOTAL"].copy()
-            if not df_chart.empty:
-                chart_data_melt = df_chart[["Departamento","Pagadas","Caidas"]].melt("Departamento", var_name="Estado", value_name="Cantidad")
-                chart = alt.Chart(chart_data_melt).mark_bar().encode(
-                    x=alt.X("Cantidad:Q", title="Ventas"),
-                    y=alt.Y("Departamento:N", sort="-x", title=""),
-                    color=alt.Color("Estado:N", scale=alt.Scale(domain=["Pagadas","Caidas"], range=["#059669","#dc2626"])),
-                    tooltip=["Departamento","Estado","Cantidad"]
-                ).properties(height=max(200, len(df_chart)*40)).configure_axis(labelFontSize=12, titleFontSize=13)
-                st.altair_chart(chart, use_container_width=True)
-            st.markdown("**Tabla de detalle por departamento**")
-            st.table(rank_dpto)
+        mostrar_ranking_departamentos_premium(df_filtrado)
 
     with tab6:
         st.markdown("#### Estados Operativos (TIPIS agrupado)")
@@ -2575,174 +2859,274 @@ def login_inicio():
         div[data-testid="collapsedControl"] {display:none !important;}
         header[data-testid="stHeader"] {background: transparent !important;}
         .block-container {
-            padding-top: 2.2rem !important;
-            max-width: 1180px !important;
+            padding-top: 1.4rem !important;
+            padding-bottom: 1.2rem !important;
+            max-width: 1220px !important;
+        }
+        .stApp::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background:
+                radial-gradient(circle at 12% 18%, rgba(37,99,235,.28), transparent 28%),
+                radial-gradient(circle at 86% 12%, rgba(124,58,237,.20), transparent 26%),
+                linear-gradient(135deg, rgba(2,6,23,.44), rgba(15,23,42,.34));
+            pointer-events: none;
+            z-index: 0;
         }
         .login-shell {
-            min-height: 78vh;
+            min-height: 84vh;
             display: flex;
             align-items: center;
             justify-content: center;
+            position: relative;
+            z-index: 1;
         }
         .login-panel {
             width: 100%;
-            background: linear-gradient(135deg, rgba(255,255,255,.94), rgba(241,247,255,.88));
-            border: 1px solid rgba(255,255,255,.70);
-            border-radius: 34px;
-            box-shadow: 0 32px 90px rgba(15, 66, 135, .24), 0 12px 32px rgba(0,0,0,.16);
-            overflow: hidden;
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
+            max-width: 1180px;
             display: grid;
-            grid-template-columns: 1.05fr .95fr;
-            min-height: 570px;
+            grid-template-columns: 1.08fr .92fr;
+            min-height: 620px;
+            border-radius: 36px;
+            overflow: hidden;
+            background: rgba(255,255,255,.92);
+            border: 1px solid rgba(255,255,255,.75);
+            box-shadow: 0 38px 110px rgba(2,8,23,.34), 0 12px 36px rgba(15,66,135,.18);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
         }
         .login-brand {
             position: relative;
-            padding: 48px 46px;
+            padding: 54px 50px;
             color: white;
             background:
-                radial-gradient(circle at 18% 18%, rgba(74,144,226,.55), transparent 28%),
-                radial-gradient(circle at 80% 72%, rgba(147,51,234,.35), transparent 30%),
-                linear-gradient(145deg, rgba(10,37,75,.96), rgba(15,66,135,.94) 55%, rgba(8,27,58,.98));
+                linear-gradient(135deg, rgba(7,24,52,.98), rgba(15,66,135,.96) 52%, rgba(79,23,135,.94)),
+                radial-gradient(circle at 78% 22%, rgba(255,255,255,.18), transparent 28%);
+            overflow: hidden;
+        }
+        .login-brand::before {
+            content: "";
+            position: absolute;
+            width: 360px;
+            height: 360px;
+            right: -120px;
+            top: -120px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.12);
+            filter: blur(1px);
         }
         .login-brand::after {
             content: "";
             position: absolute;
             inset: 0;
-            background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,.10) 45%, transparent 70%);
+            background:
+                linear-gradient(120deg, transparent 0%, rgba(255,255,255,.11) 48%, transparent 78%),
+                repeating-linear-gradient(90deg, rgba(255,255,255,.045) 0 1px, transparent 1px 64px);
             pointer-events: none;
+        }
+        .login-brand-content {
+            position: relative;
+            z-index: 2;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        .login-topline {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            margin-bottom: 48px;
+        }
+        .login-logo-mark {
+            width: 50px;
+            height: 50px;
+            border-radius: 18px;
+            display: grid;
+            place-items: center;
+            background: rgba(255,255,255,.16);
+            border: 1px solid rgba(255,255,255,.28);
+            font-size: 24px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.20);
         }
         .login-badge {
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            padding: 9px 14px;
+            padding: 10px 15px;
             border-radius: 999px;
-            background: rgba(255,255,255,.14);
-            border: 1px solid rgba(255,255,255,.26);
-            font-size: 12px;
-            font-weight: 900;
-            letter-spacing: .12em;
+            background: rgba(255,255,255,.13);
+            border: 1px solid rgba(255,255,255,.24);
+            color: rgba(255,255,255,.88);
+            font-size: 11px;
+            font-weight: 950;
+            letter-spacing: .14em;
             text-transform: uppercase;
-            margin-bottom: 30px;
+            white-space: nowrap;
         }
         .login-main-title {
-            font-size: 46px;
-            line-height: 1.02;
+            font-size: 54px;
+            line-height: .98;
             font-weight: 950;
-            margin: 0 0 16px 0;
-            letter-spacing: -.04em;
+            margin: 0 0 18px 0;
+            letter-spacing: -.055em;
+        }
+        .login-main-title span {
+            color: #bfdbfe;
         }
         .login-main-subtitle {
             font-size: 16px;
-            line-height: 1.55;
-            color: rgba(255,255,255,.82);
-            max-width: 430px;
+            line-height: 1.65;
+            color: rgba(255,255,255,.80);
+            max-width: 470px;
             margin-bottom: 34px;
-            font-weight: 600;
+            font-weight: 650;
         }
         .login-feature-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 14px;
-            margin-top: 34px;
+            margin-top: auto;
         }
         .login-feature {
             background: rgba(255,255,255,.12);
             border: 1px solid rgba(255,255,255,.18);
-            border-radius: 18px;
-            padding: 16px;
+            border-radius: 20px;
+            padding: 16px 16px 15px 16px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.12);
         }
         .login-feature strong {
             display: block;
             font-size: 18px;
             font-weight: 950;
-            margin-bottom: 4px;
+            margin-bottom: 5px;
+            letter-spacing: -.02em;
         }
         .login-feature span {
             display: block;
             font-size: 12px;
-            font-weight: 700;
+            line-height: 1.35;
+            font-weight: 750;
             color: rgba(255,255,255,.72);
         }
         .login-form-area {
-            padding: 46px 44px;
+            padding: 50px 46px;
             display: flex;
             flex-direction: column;
             justify-content: center;
+            background:
+                linear-gradient(180deg, rgba(255,255,255,.96), rgba(248,250,252,.94));
         }
         .login-form-card {
-            background: rgba(255,255,255,.86);
+            background: rgba(255,255,255,.96);
             border: 1px solid rgba(15,66,135,.10);
-            border-radius: 28px;
-            padding: 30px 28px 26px 28px;
-            box-shadow: 0 18px 45px rgba(15,66,135,.10);
+            border-radius: 30px;
+            padding: 32px 30px 26px 30px;
+            box-shadow: 0 22px 54px rgba(15,66,135,.11);
+        }
+        .login-form-kicker {
+            color: #2563eb;
+            font-size: 11px;
+            font-weight: 950;
+            letter-spacing: .16em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
         }
         .login-form-title {
-            color: #0f4287;
-            font-size: 30px;
+            color: #0f172a;
+            font-size: 32px;
             font-weight: 950;
-            letter-spacing: -.03em;
-            margin-bottom: 6px;
+            letter-spacing: -.04em;
+            margin-bottom: 8px;
             text-align: left;
         }
         .login-form-subtitle {
             color: #64748b;
             font-size: 14px;
             font-weight: 700;
-            line-height: 1.45;
+            line-height: 1.50;
             margin-bottom: 24px;
             text-align: left;
         }
+        div[data-testid="stSelectbox"] label,
         div[data-testid="stTextInput"] label {
             color: #334155 !important;
-            font-weight: 900 !important;
-            font-size: 13px !important;
-            letter-spacing: .04em;
+            font-weight: 950 !important;
+            font-size: 12px !important;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+        div[data-testid="stSelectbox"] > div,
+        div[data-testid="stTextInput"] input {
+            border-radius: 16px !important;
         }
         div[data-testid="stTextInput"] input {
-            border-radius: 15px !important;
             border: 1px solid rgba(15,66,135,.18) !important;
             background: #f8fafc !important;
-            min-height: 48px !important;
-            font-weight: 700 !important;
+            min-height: 50px !important;
+            font-weight: 800 !important;
+            color: #0f172a !important;
         }
         div[data-testid="stTextInput"] input:focus {
             border-color: #2563eb !important;
-            box-shadow: 0 0 0 3px rgba(37,99,235,.14) !important;
+            box-shadow: 0 0 0 4px rgba(37,99,235,.13) !important;
         }
         .stButton > button {
-            background: linear-gradient(135deg, #0f4287, #2563eb) !important;
+            background: linear-gradient(135deg, #0f4287 0%, #2563eb 55%, #4f46e5 100%) !important;
             color: white !important;
             border: 0 !important;
-            border-radius: 16px !important;
-            min-height: 50px !important;
+            border-radius: 17px !important;
+            min-height: 52px !important;
             font-weight: 950 !important;
-            letter-spacing: .04em !important;
-            box-shadow: 0 16px 30px rgba(37,99,235,.24) !important;
-            transition: transform .15s ease, box-shadow .15s ease !important;
+            letter-spacing: .06em !important;
+            text-transform: uppercase !important;
+            box-shadow: 0 18px 34px rgba(37,99,235,.28) !important;
+            transition: transform .16s ease, box-shadow .16s ease, filter .16s ease !important;
         }
         .stButton > button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 20px 38px rgba(37,99,235,.32) !important;
+            transform: translateY(-2px);
+            filter: brightness(1.04);
+            box-shadow: 0 24px 44px rgba(37,99,235,.36) !important;
+        }
+        .login-security-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin: 18px 0 2px 0;
+        }
+        .login-security-pill {
+            border-radius: 16px;
+            padding: 12px 13px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            color: #475569;
+            font-size: 12px;
+            font-weight: 850;
+            text-align: center;
         }
         .login-footnote {
             margin-top: 18px;
-            padding: 12px 14px;
-            border-radius: 16px;
-            background: #eff6ff;
+            padding: 13px 15px;
+            border-radius: 17px;
+            background: linear-gradient(135deg, #eff6ff, #f5f3ff);
             border: 1px solid #dbeafe;
             color: #1e3a8a;
             font-size: 12px;
-            font-weight: 800;
+            font-weight: 900;
             text-align: center;
         }
-        @media (max-width: 900px) {
-            .login-panel { grid-template-columns: 1fr; }
-            .login-brand { padding: 34px 28px; }
-            .login-form-area { padding: 28px; }
-            .login-main-title { font-size: 36px; }
+        @media (max-width: 950px) {
+            .login-panel { grid-template-columns: 1fr; min-height: auto; }
+            .login-brand { padding: 38px 30px; }
+            .login-form-area { padding: 30px; }
+            .login-main-title { font-size: 40px; }
+            .login-topline { margin-bottom: 30px; }
+        }
+        @media (max-width: 560px) {
+            .login-feature-grid, .login-security-row { grid-template-columns: 1fr; }
+            .login-main-title { font-size: 34px; }
+            .login-form-card { padding: 26px 22px; }
         }
     </style>
     """, unsafe_allow_html=True)
@@ -2751,22 +3135,28 @@ def login_inicio():
     <div class="login-shell">
         <div class="login-panel">
             <div class="login-brand">
-                <div class="login-badge">🔐 Acceso privado</div>
-                <h1 class="login-main-title">Dashboard Teletalk Digital</h1>
-                <div class="login-main-subtitle">
-                    Plataforma ejecutiva para seguimiento de ventas, comisiones, efectividad comercial y control operativo.
-                </div>
-                <div class="login-feature-grid">
-                    <div class="login-feature"><strong>Fija</strong><span>Instalación, venta y rankings</span></div>
-                    <div class="login-feature"><strong>Móvil</strong><span>Portabilidad, altas y detalle</span></div>
-                    <div class="login-feature"><strong>KPI</strong><span>Indicadores gerenciales</span></div>
-                    <div class="login-feature"><strong>Control</strong><span>Acceso protegido</span></div>
+                <div class="login-brand-content">
+                    <div class="login-topline">
+                        <div class="login-logo-mark">📊</div>
+                        <div class="login-badge">Acceso ejecutivo seguro</div>
+                    </div>
+                    <h1 class="login-main-title">Dashboard <span>Teletalk</span> Digital</h1>
+                    <div class="login-main-subtitle">
+                        Centro de control gerencial para ventas, comisiones, productividad comercial y seguimiento operativo en tiempo real.
+                    </div>
+                    <div class="login-feature-grid">
+                        <div class="login-feature"><strong>Fija</strong><span>Instalaciones, ventas, caídas y ranking</span></div>
+                        <div class="login-feature"><strong>Móvil</strong><span>Portabilidad, altas y desempeño</span></div>
+                        <div class="login-feature"><strong>KPI</strong><span>Indicadores ejecutivos de gestión</span></div>
+                        <div class="login-feature"><strong>Auditoría</strong><span>Control interno y trazabilidad</span></div>
+                    </div>
                 </div>
             </div>
             <div class="login-form-area">
                 <div class="login-form-card">
+                    <div class="login-form-kicker">Panel privado</div>
                     <div class="login-form-title">Iniciar sesión</div>
-                    <div class="login-form-subtitle">Ingresa tus credenciales autorizadas para continuar.</div>
+                    <div class="login-form-subtitle">Ingresa tus credenciales autorizadas para acceder al tablero corporativo.</div>
     """, unsafe_allow_html=True)
 
     USUARIOS = {
@@ -2794,7 +3184,11 @@ def login_inicio():
             st.error("Usuario o contraseña incorrectos.")
 
     st.markdown("""
-                    <div class="login-footnote">Sistema protegido · Uso interno autorizado</div>
+                    <div class="login-security-row">
+                        <div class="login-security-pill">🔐 Acceso restringido</div>
+                        <div class="login-security-pill">📈 Uso gerencial</div>
+                    </div>
+                    <div class="login-footnote">Sistema protegido · Información confidencial · Uso interno autorizado</div>
                 </div>
             </div>
         </div>
