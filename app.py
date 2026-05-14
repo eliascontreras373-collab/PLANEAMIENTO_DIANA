@@ -3165,6 +3165,7 @@ def login_inicio():
         "LuisT": "Corp.LT_2026!k",
         "Isabel": "Corp.I_2026!k",
         "DavidG": "Corp.DG_2026!k",
+        "SusanG": "Corp.SG_2026!k",
         "JoseM": "Corp.JM_2026!k"
     }
 
