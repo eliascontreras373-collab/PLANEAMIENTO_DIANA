@@ -3161,6 +3161,7 @@ def login_inicio():
 
     USUARIOS = {
         "Fiorella": "F10r3LLa123*",
+        "JoselynC": "Corp.JC_2026!k",
         "LuisT": "Corp.LT_2026!k",
         "Isabel": "Corp.I_2026!k",
         "DavidG": "Corp.DG_2026!k",
